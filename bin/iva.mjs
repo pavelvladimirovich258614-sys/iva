@@ -1167,21 +1167,6 @@ async function cmdSecret(args) {
 //   stop the bridge → change the subscription at MAX → update .env → start the bridge in the new mode.
 const MAX_UPDATE_TYPES = ["message_created", "message_callback", "bot_started"];
 
-function validateWebhookUrl(raw) {
-  let u;
-  try {
-    u = new URL(raw);
-  } catch {
-    throw new Error("not a valid URL");
-  }
-  if (u.protocol !== "https:") throw new Error("MAX requires HTTPS");
-  if (u.port && u.port !== "443") throw new Error("MAX requires port 443");
-  if (u.username || u.password || u.search || u.hash) throw new Error("the URL must not contain credentials, a query or a fragment");
-  if (/^(localhost|127\.|10\.|192\.168\.|0\.0\.0\.0|\[?::1)/i.test(u.hostname)) throw new Error("the host must be publicly reachable by MAX, not a local address");
-  if (u.pathname.length < 2) throw new Error("the URL needs a path (e.g. /max/webhook)");
-  return u.toString();
-}
-
 async function cmdMaxWebhook(args, { client, env }) {
   const sub = args[0];
   const flags = new Set(args.slice(1));
@@ -1208,6 +1193,7 @@ async function cmdMaxWebhook(args, { client, env }) {
   }
 
   if (sub === "set") {
+    const { validateWebhookUrl } = await import("../scripts/lib/max-setup.mjs");
     const url = (() => {
       try {
         return validateWebhookUrl(args[1] || "");

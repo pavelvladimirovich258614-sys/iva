@@ -148,7 +148,7 @@ export default {
           [ctx.backRow(PARENT)],
         );
       }
-      if (!ctx.secretsInChat()) {
+      if (ctx.secretsInChat && !ctx.secretsInChat()) {
         st.awaitText = null;
         return ctx.flows.screen(
           st,
@@ -172,7 +172,7 @@ export default {
 
     if (step === "connect") {
       const T = ctx.tr;
-      if (!ctx.secretsInChat()) {
+      if (ctx.secretsInChat && !ctx.secretsInChat()) {
         st.awaitText = null;
         return ctx.flows.screen(
           st,

@@ -195,7 +195,7 @@ export default {
           [ctx.backRow(PARENT)],
         );
       }
-      if (!ctx.secretsInChat()) {
+      if (ctx.secretsInChat && !ctx.secretsInChat()) {
         st.awaitText = null;
         return ctx.flows.screen(
           st,

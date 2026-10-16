@@ -69,7 +69,7 @@ async function fixture(t, envText) {
   await writeFile(sc, FAKE_SYSTEMCTL);
   await chmod(sc, 0o755);
 
-  const run = (args, extraEnv = {}) =>
+  const run = (args, extraEnv = {}, input = "") =>
     new Promise((resolve) => {
       const child = spawn(process.execPath, [join(project, "bin/iva.mjs"), ...args], {
         env: {
@@ -81,6 +81,7 @@ async function fixture(t, envText) {
           ...extraEnv,
         },
       });
+      child.stdin.end(input);
       let out = "";
       child.stdout.on("data", (d) => (out += d));
       child.stderr.on("data", (d) => (out += d));
@@ -187,4 +188,47 @@ test("doctor treats MAX settings as required for a MAX install and Telegram ones
   const r = await f.run(["doctor"]);
   assert.match(r.out, /missing: [^\n]*MAX_ALLOWED_USER_IDS/);
   assert.doesNotMatch(r.out.split("\n").find((l) => /missing:/.test(l)) ?? "", /TELEGRAM|DEEPGRAM/);
+});
+
+test("iva secret set: value read from stdin, written to .env 0600, never echoed", async (t) => {
+  const f = await fixture(t, MAX_ENV());
+  const KEY = "sk-live-0123456789abcdef-SECRET";
+  const r = await f.run(["secret", "set", "OLLAMA_API_KEY"], {}, `${KEY}\n`);
+  assert.equal(r.status, 0, r.out);
+  assert.ok(!r.out.includes(KEY), "the value must not appear in the output");
+  assert.match(r.out, /OLLAMA_API_KEY saved to \.env/);
+  const env = await readFile(join(f.project, ".env"), "utf8");
+  assert.match(env, new RegExp(`^OLLAMA_API_KEY=${KEY}$`, "m"));
+  assert.match(env, /^IVA_CHANNELS=max$/m, "other settings are preserved");
+  const { statSync } = await import("node:fs");
+  assert.equal(statSync(join(f.project, ".env")).mode & 0o077, 0, ".env stays private");
+  // повторная установка заменяет значение, а не дублирует строку
+  await f.run(["secret", "set", "OLLAMA_API_KEY"], {}, "another-value-123456\n");
+  assert.equal((await readFile(join(f.project, ".env"), "utf8")).match(/^OLLAMA_API_KEY=/gm).length, 1);
+});
+
+test("iva secret set: refuses arbitrary names and malformed values, saving nothing", async (t) => {
+  const f = await fixture(t, MAX_ENV());
+  const before = await readFile(join(f.project, ".env"), "utf8");
+  for (const [name, value] of [["ASSISTANT_BEARER", "x".repeat(40)], ["PATH", "/bin"], ["lowercase_api_key", "x".repeat(20)], ["OLLAMA_API_KEY", "short"], ["OLLAMA_API_KEY", "has space inside the value"], ["OLLAMA_API_KEY", ""]]) {
+    const r = await f.run(["secret", "set", name], {}, `${value}\n`);
+    assert.notEqual(r.status, 0, `${name}=${JSON.stringify(value)} must be rejected`);
+  }
+  assert.equal(await readFile(join(f.project, ".env"), "utf8"), before);
+});
+
+test("iva secret set MAX_BOT_TOKEN is verified with GET /me before it is saved", async (t) => {
+  const mock = await startMockMax();
+  t.after(() => mock.close());
+  const f = await fixture(t, MAX_ENV(`MAX_API_BASE_URL=${mock.url}\n`));
+  const GOOD = "tok"; // mock принимает только токен «tok»
+  const ok = await f.run(["secret", "set", "MAX_BOT_TOKEN", "--no-verify"], {}, "brand-new-token-123456\n");
+  assert.equal(ok.status, 0, ok.out);
+  assert.match(await readFile(join(f.project, ".env"), "utf8"), /^MAX_BOT_TOKEN=brand-new-token-123456$/m);
+  assert.ok(!mock.seen.some((r) => r.path === "/me"), "--no-verify skips the API call");
+  const accepted = await f.run(["secret", "set", "MAX_BOT_TOKEN"], {}, `${GOOD}-valid-token\n`);
+  // mock отвечает на /me для любого токена 200 — проверяем сам факт проверки и вывод без значения
+  assert.equal(accepted.status, 0, accepted.out);
+  assert.ok(mock.seen.some((r) => r.path === "/me" && r.auth === `${GOOD}-valid-token`));
+  assert.ok(!accepted.out.includes(`${GOOD}-valid-token`));
 });

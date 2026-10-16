@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { MAX_SECRET_RE, peekMaxUsers, setupMaxChannel, validateMaxToken } from "./max-setup.mjs";
+import { MAX_SECRET_RE, peekMaxUsers, setupMaxChannel, validateMaxToken, validateWebhookUrl } from "./max-setup.mjs";
 import { channelServices, configuredChannels, unusedBridgeUnits, channelLabel } from "./channels.mjs";
 
 const C = { g: "", y: "", c: "", b: "", r: "", x: "" };
@@ -98,8 +98,8 @@ test("setup step keeps an existing valid secret, asks again for a rejected token
     n++;
     return m.fetchImpl(url, init);
   };
-  const existing = { MAX_WEBHOOK_SECRET: "kept-secret_123", MAX_INGEST: "webhook" };
-  await setupMaxChannel({ io: io(["bad", "good", "", "12345"]), existing, out, fetchImpl, env: { MAX_API_BASE_URL: "http://127.0.0.1:1" } });
+  const existing = { MAX_WEBHOOK_SECRET: "kept-secret_123", MAX_INGEST: "webhook", MAX_WEBHOOK_URL: "https://iva.example.com/max/webhook" };
+  await setupMaxChannel({ io: io(["bad", "good", "", "12345", "", ""]), existing, out, fetchImpl, env: { MAX_API_BASE_URL: "http://127.0.0.1:1" } });
   assert.equal(out.MAX_BOT_TOKEN, "good");
   assert.equal(out.MAX_WEBHOOK_SECRET, "kept-secret_123");
   assert.equal(out.MAX_INGEST, "webhook");
@@ -110,7 +110,7 @@ test("setup step keeps an existing valid secret, asks again for a rejected token
 test("manual id input ignores non-numeric garbage and never leaves the allowlist empty", async () => {
   const m = mockMax({ updates: [] });
   const out = {};
-  await setupMaxChannel({ io: io(["tok", "", "abc, ", "", "777"]), existing: {}, out, fetchImpl: m.fetchImpl, env: { MAX_API_BASE_URL: "http://127.0.0.1:1" } });
+  await setupMaxChannel({ io: io(["tok", "", "abc, ", "", "777", ""]), existing: {}, out, fetchImpl: m.fetchImpl, env: { MAX_API_BASE_URL: "http://127.0.0.1:1" } });
   assert.equal(out.MAX_ALLOWED_USER_IDS, "777");
 });
 
@@ -134,4 +134,35 @@ test("legacy installs without IVA_CHANNELS are inferred from tokens; webhook ing
   assert.deepEqual(channelServices({ IVA_CHANNELS: "max", MAX_BOT_TOKEN: "t", MAX_WEBHOOK_SECRET: "s", MAX_INGEST: "webhook" }), ["iva.service", "iva-max-bridge.service"]); // мост принимает и webhook
   assert.deepEqual(channelServices({}), ["iva.service", "iva-telegram-poll.service"]);
   assert.equal(configuredChannels({ IVA_CHANNELS: "garbage" }).telegram, true); // unknown value → inferred (legacy default)
+});
+
+test("webhook choice: asks for a public HTTPS URL, rejects unsafe ones, stores it, never registers anything", async () => {
+  const m = mockMax({ updates: [upd(41)] });
+  const out = {};
+  const lines = [];
+  // токен; Done; выбрать все; доставка=2; плохие адреса; хороший
+  await setupMaxChannel({
+    io: io(["tok", "", "", "2", "http://x.example/max/webhook", "https://localhost/max/webhook", "https://iva.example.com:8443/x", "https://iva.example.com/max/webhook"], lines),
+    existing: {}, out, fetchImpl: m.fetchImpl, env: { MAX_API_BASE_URL: "http://127.0.0.1:1" },
+  });
+  assert.equal(out.MAX_INGEST, "webhook");
+  assert.equal(out.MAX_WEBHOOK_URL, "https://iva.example.com/max/webhook");
+  assert.ok(lines.join("\n").includes("iva max webhook set https://iva.example.com/max/webhook"));
+  assert.ok(!m.calls.some((c) => c.path === "/subscriptions"), "the wizard must not touch subscriptions");
+});
+
+test("polling choice clears a stale webhook URL", async () => {
+  const m = mockMax({ updates: [upd(41)] });
+  const out = {};
+  await setupMaxChannel({ io: io(["tok", "", "", "1"]), existing: { MAX_INGEST: "webhook", MAX_WEBHOOK_URL: "https://old.example/x" }, out, fetchImpl: m.fetchImpl, env: { MAX_API_BASE_URL: "http://127.0.0.1:1" } });
+  assert.equal(out.MAX_INGEST, "poll");
+  assert.equal(out.MAX_WEBHOOK_URL, "");
+});
+
+test("webhook URL validation", () => {
+  assert.equal(validateWebhookUrl("https://iva.example.com/max/webhook"), "https://iva.example.com/max/webhook");
+  assert.equal(validateWebhookUrl("https://iva.example.com:443/max/webhook"), "https://iva.example.com/max/webhook");
+  for (const bad of ["http://iva.example.com/x", "https://iva.example.com/", "https://iva.example.com:8443/x", "https://u:p@iva.example.com/x", "https://iva.example.com/x?token=1", "https://127.0.0.1/x", "https://192.168.1.2/x", "https://localhost/x", "nonsense"]) {
+    assert.throws(() => validateWebhookUrl(bad), undefined, bad);
+  }
 });

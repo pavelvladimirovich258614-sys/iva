@@ -5,6 +5,22 @@ import { randomBytes } from "node:crypto";
 import { createMaxClient, resolveMaxBaseUrl } from "../../agent/lib/max-api.ts";
 
 export const MAX_SECRET_RE = /^[A-Za-z0-9_-]{5,256}$/;
+
+/** Публичный адрес webhook для MAX: HTTPS, порт 443, без учётных данных/query, не локальный хост. Бросает Error с причиной. */
+export function validateWebhookUrl(raw) {
+  let u;
+  try {
+    u = new URL(raw);
+  } catch {
+    throw new Error("not a valid URL");
+  }
+  if (u.protocol !== "https:") throw new Error("MAX requires HTTPS");
+  if (u.port && u.port !== "443") throw new Error("MAX requires port 443");
+  if (u.username || u.password || u.search || u.hash) throw new Error("the URL must not contain credentials, a query or a fragment");
+  if (/^(localhost|127\.|10\.|192\.168\.|0\.0\.0\.0|\[?::1)/i.test(u.hostname)) throw new Error("the host must be publicly reachable by MAX, not a local address");
+  if (u.pathname.length < 2) throw new Error("the URL needs a path (e.g. /max/webhook)");
+  return u.toString();
+}
 const ID_RE = /^\d+$/;
 
 export function makeClient(token, env = process.env, fetchImpl) {
@@ -68,7 +84,6 @@ export async function setupMaxChannel({ io, existing, out, env = process.env, fe
   if (me?.username) say(`  → ${t("bot", "бот")}: ${C.g}@${me.username}${C.x}`);
   // Секрет webhook/внутренней связки мост↔агент: случайный, ≥5 символов [A-Za-z0-9_-] (требование MAX).
   out.MAX_WEBHOOK_SECRET = MAX_SECRET_RE.test(existing.MAX_WEBHOOK_SECRET || "") ? existing.MAX_WEBHOOK_SECRET : randomBytes(24).toString("hex");
-  out.MAX_INGEST = existing.MAX_INGEST === "webhook" ? "webhook" : "poll";
 
   say(`\n  ${C.y}${t("IMPORTANT:", "ВАЖНО:")}${C.x} ${t("Iva answers ONLY trusted MAX user IDs.", "Iva отвечает ТОЛЬКО доверенным MAX user_id.")}`);
   say(`  ${t("Without at least one ID the bot stays silent to everyone (that's how your data is protected).", "Без хотя бы одного ID бот промолчит всем (так ваши данные защищены).")}`);
@@ -98,5 +113,30 @@ export async function setupMaxChannel({ io, existing, out, env = process.env, fe
   }
   out.MAX_ALLOWED_USER_IDS = [...ids].join(",");
   say(`  → ${t("access granted to ID", "доступ разрешён ID")}: ${C.g}${out.MAX_ALLOWED_USER_IDS}${C.x}`);
-  return { username: out.MAX_BOT_USERNAME, ids: [...ids] };
+
+  // Способ получения событий — после поиска id (polling-подглядывание работает, пока подписки нет).
+  say(`\n  ${t("How should MAX deliver events to Iva?", "Как MAX будет доставлять события Иве?")}`);
+  say(`    1) ${t("polling — works anywhere, no domain needed (MAX recommends it only for development/testing)", "polling — работает где угодно, домен не нужен (MAX рекомендует его лишь для разработки и тестов)")}`);
+  say(`    2) ${t("webhook — recommended for permanent use; needs a domain with HTTPS on port 443", "webhook — рекомендуется для постоянной работы; нужен домен с HTTPS на порту 443")}`);
+  const ingestChoice = (await ask(`  ${t("Delivery", "Доставка")} (1/2)`, existing.MAX_INGEST === "webhook" ? "2" : "1")).trim();
+  if (ingestChoice === "2") {
+    out.MAX_INGEST = "webhook";
+    for (;;) {
+      const url = (await ask(`  ${t("Public webhook URL (https://your.domain/max/webhook)", "Публичный адрес webhook (https://ваш.домен/max/webhook)")}`, existing.MAX_WEBHOOK_URL || "")).trim();
+      try {
+        out.MAX_WEBHOOK_URL = validateWebhookUrl(url);
+        break;
+      } catch (e) {
+        say(`${C.y}  ⚠ ${t(`URL rejected: ${e.message}`, `Адрес не подошёл: ${e.message}`)}${C.x}`);
+      }
+    }
+    say(`  ${C.y}${t(
+      "The wizard does NOT register the webhook at MAX. After install: publish only /max/webhook through your reverse proxy (deploy/nginx-max-webhook.conf.example), then run:  iva max webhook set " + out.MAX_WEBHOOK_URL,
+      "Мастер НЕ регистрирует webhook в MAX. После установки: опубликуйте через reverse proxy только /max/webhook (deploy/nginx-max-webhook.conf.example) и выполните:  iva max webhook set " + out.MAX_WEBHOOK_URL,
+    )}${C.x}`);
+  } else {
+    out.MAX_INGEST = "poll";
+    out.MAX_WEBHOOK_URL = "";
+  }
+  return { username: out.MAX_BOT_USERNAME, ids: [...ids], ingest: out.MAX_INGEST };
 }

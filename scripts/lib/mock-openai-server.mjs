@@ -74,8 +74,14 @@ async function readBody(req) {
 /** Стартует mock-провайдер на 127.0.0.1:0; handle: { baseUrl, requests, close }. */
 export async function startMockOpenAiServer({ delayFor } = {}) {
   const requests = [];
+  const state = { modelsStatus: 200 }; // тесты могут «ронять» каталог моделей
   const server = createServer(async (req, res) => {
     if (req.method === "GET" && req.url === "/v1/models") {
+      if (state.modelsStatus !== 200) {
+        res.writeHead(state.modelsStatus, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: { message: "catalog down" } }));
+        return;
+      }
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ object: "list", data: [{ id: MODEL }, { id: "iva-alt" }] }));
       return;
@@ -118,6 +124,7 @@ export async function startMockOpenAiServer({ delayFor } = {}) {
   return {
     baseUrl: `http://127.0.0.1:${port}/v1`,
     requests,
+    state,
     close: () => new Promise((resolve) => server.close(resolve)),
   };
 }
