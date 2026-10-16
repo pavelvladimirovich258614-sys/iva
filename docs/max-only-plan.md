@@ -31,10 +31,17 @@ Webhook MAX требует публичный HTTPS (443) — для лично�
 обработчик, дедуп и outbox: второй агент и второй пайплайн не создаются.
 Webhook-подписка и polling взаимоисключающи; мост предупреждает, если подписка существует.
 
-## Этапы
+## Этапы (статус)
 
-1. ✅ Надёжность webhook (inbox/outbox, лимиты, e2e) — коммит `814ad23`.
-2. Единые уведомления `notify.mjs` (дайджест, отчёты памяти, doctor, update-check) + тесты без `TELEGRAM_*`.
-3. MAX-мост (`max-bridge.mjs`): polling → обработчик, команды, меню/мастера, callback-кнопки.
-4. Установка и эксплуатация: `setup.mjs`, `install.sh`, `bin/iva.mjs`, systemd-юниты, `.env.example`, документация.
-5. Проверки MAX-only: typecheck, build, replica, e2e без `TELEGRAM_*`, рестарт, фоновые задачи.
+1. ✅ Надёжность webhook (inbox/outbox, лимиты, e2e) — `814ad23`.
+2. ✅ Единые уведомления `scripts/lib/notify.mjs` (дайджест, отчёты памяти, doctor, update-check) — `348a6fa`.
+3. ✅ MAX-мост `scripts/max-bridge.mjs`: polling → единый канал, `/menu` `/model` `/think` `/restart` `/update`, кнопки — `f51396c`.
+4. ✅ Установка и эксплуатация: `IVA_CHANNELS`, `setup.mjs`, `install.sh`, `bin/iva.mjs` (сервисы, doctor, `iva max`), юнит `iva-max-bridge`, инструкции агента, документация.
+5. ✅ Проверки MAX-only: typecheck, build, replica, e2e без `TELEGRAM_*` (агент, мост, кнопки, рестарт, фоновые задачи), юнит-тесты установки.
+
+## Не проверено вживую
+
+- Реальный MAX API (боевой бот): форматы взяты из `max-messenger/api-schema` (v0.0.33), живого теста не было.
+- Интерактивный прогон `install.sh`/мастера целиком и настоящий systemd (в тестах — подменённый `systemctl`).
+- Удаляет ли MAX сообщения пользователя с ключом (иначе мастер просит удалить вручную).
+- Принимает ли `PUT /messages` правку только клавиатуры без текста (используется для снятия кнопок, ошибка игнорируется).
