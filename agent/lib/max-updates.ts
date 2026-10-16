@@ -5,6 +5,7 @@ import { createHash, timingSafeEqual } from "node:crypto";
 
 export const MAX_SECRET_HEADER = "x-max-bot-api-secret";
 export const MAX_BODY_LIMIT = 256 * 1024;
+export const MAX_BODY_TIMEOUT_MS = 10_000;
 
 export interface MaxConfig {
   token: string;
@@ -33,14 +34,14 @@ export function verifyMaxSecret(received: string | null, expected: string): bool
   return timingSafeEqual(digest(received), digest(expected));
 }
 
-const BIG_ID_RE = /("(?:user_id|chat_id|id|chat)"\s*:\s*)(-?\d{16,})(?=\s*[,}\]])/g;
+const BIG_ID_RE = /("(?:user_id|chat_id|id|seq)"\s*:\s*)(-?\d{16,})(?=\s*[,}\]])/g;
 
 export function parseMaxJson(raw: string): unknown {
   return JSON.parse(raw.replace(BIG_ID_RE, '$1"$2"'));
 }
 
 export type MaxEvent =
-  | { kind: "message"; dedupKey: string; userId: string; chatId: string; text: string }
+  | { kind: "message"; dedupKey: string; userId: string; chatId: string | null; text: string }
   | { kind: "bot_started"; dedupKey: string; userId: string; chatId: string }
   | { kind: "ignore"; reason: string };
 
@@ -52,61 +53,46 @@ const id = (v: unknown): string | null => {
 const obj = (v: unknown): Record<string, any> | null =>
   v && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, any>) : null;
 
-/** Нормализует Update. Только личные текстовые сообщения от людей и bot_started. */
+/**
+ * Нормализует Update по официальной схеме (api-schema schema.yaml).
+ * message_created: Message.sender nullable (пост от имени канала), Recipient.chat_id/user_id
+ * nullable, chat_type обязателен (dialog|chat|channel), MessageBody.text nullable.
+ * Обрабатываем только dialog + человек + непустой текст; chat_id необязателен — без него
+ * ответ адресуется по user_id отправителя.
+ */
 export function normalizeMaxUpdate(input: unknown): MaxEvent {
   const u = obj(input);
   if (!u) return { kind: "ignore", reason: "not-object" };
   const ts = id(u.timestamp) ?? "0";
 
   if (u.update_type === "bot_started") {
-    const userId = id(obj(u.user)?.user_id);
+    const user = obj(u.user);
+    const userId = id(user?.user_id);
     const chatId = id(u.chat_id);
     if (!userId || !chatId) return { kind: "ignore", reason: "malformed" };
-    if (obj(u.user)?.is_bot === true) return { kind: "ignore", reason: "bot" };
+    if (user?.is_bot === true) return { kind: "ignore", reason: "bot" };
     return { kind: "bot_started", dedupKey: `started:${chatId}:${userId}:${ts}`, userId, chatId };
   }
 
   if (u.update_type === "message_created") {
     const m = obj(u.message);
-    const sender = obj(m?.sender);
+    const sender = obj(m?.sender); // null для постов от имени канала
     const recipient = obj(m?.recipient);
-    const userId = id(sender?.user_id);
-    const chatId = id(recipient?.chat_id);
-    if (!m || !userId || !chatId) return { kind: "ignore", reason: "malformed" };
-    if (sender?.is_bot === true) return { kind: "ignore", reason: "bot" };
-    if (recipient?.chat_type !== undefined && recipient.chat_type !== "dialog") {
+    const body = obj(m?.body);
+    if (!m || !recipient || !body) return { kind: "ignore", reason: "malformed" };
+    if (recipient.chat_type !== "dialog") {
+      // chat/channel — вне MVP; отсутствие/неизвестное значение — тоже fail-closed.
       return { kind: "ignore", reason: "not-private" };
     }
-    // chat_type отсутствует → fail-closed: не считаем диалог личным.
-    if (recipient?.chat_type === undefined) return { kind: "ignore", reason: "not-private" };
-    const text = typeof obj(m.body)?.text === "string" ? (m.body.text as string).trim() : "";
+    const userId = id(sender?.user_id);
+    if (!userId) return { kind: "ignore", reason: "no-sender" };
+    if (sender?.is_bot === true) return { kind: "ignore", reason: "bot" };
+    const text = typeof body.text === "string" ? body.text.trim() : "";
     if (!text) return { kind: "ignore", reason: "no-text" };
-    const mid = typeof obj(m.body)?.mid === "string" ? m.body.mid : `${chatId}:${userId}:${ts}`;
-    return { kind: "message", dedupKey: `msg:${mid}`, userId, chatId, text };
+    const chatId = id(recipient.chat_id); // nullable по схеме
+    const mid = typeof body.mid === "string" && body.mid ? body.mid : null;
+    const dedupKey = mid ? `msg:${mid}` : `msg:${userId}:${ts}:${id(body.seq) ?? ""}`;
+    return { kind: "message", dedupKey, userId, chatId, text };
   }
   return { kind: "ignore", reason: `type:${String(u.update_type)}` };
-}
-
-/** Ограниченный по размеру и TTL журнал уже принятых событий (защита от повторной доставки). */
-export function createDedup(ttlMs = 60 * 60_000, max = 5000, now: () => number = Date.now) {
-  const seen = new Map<string, number>();
-  const prune = () => {
-    const t = now();
-    for (const [k, at] of seen) {
-      if (t - at > ttlMs || seen.size > max) seen.delete(k);
-      else break; // Map хранит порядок вставки
-    }
-  };
-  return {
-    /** true — событие новое и теперь помечено. */
-    claim(key: string): boolean {
-      prune();
-      if (seen.has(key)) return false;
-      seen.set(key, now());
-      return true;
-    },
-    release(key: string) {
-      seen.delete(key);
-    },
-  };
 }
