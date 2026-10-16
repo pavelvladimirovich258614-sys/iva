@@ -384,7 +384,8 @@ async function showTree() {
 async function cmdUpdate(args) {
   const force = args.includes("--force");
   const verbose = args.includes("--verbose");
-  const telegramJobAt = args.indexOf("--telegram-job");
+  // --job is the transport-neutral flag; --telegram-job stays for bridges started before the MAX channel.
+  const telegramJobAt = Math.max(args.indexOf("--job"), args.indexOf("--telegram-job"));
   const telegramJobId = telegramJobAt >= 0 ? args[telegramJobAt + 1] || "" : "";
   const locale = (readEnv().AGENT_LANGUAGE || process.env.AGENT_LANGUAGE) === "ru" ? "ru" : "en";
   const text = locale === "ru"
@@ -407,9 +408,21 @@ async function cmdUpdate(args) {
   const env = readEnv();
   const dataDir = dataDirAbs(env);
   const loadedJob = await loadTelegramJob(dataDir, telegramJobId);
-  const reporter = loadedJob
-    ? createTelegramUpdateReporter({ token: env.TELEGRAM_BOT_TOKEN, job: loadedJob.job, env })
-    : null;
+  // MAX modules are loaded lazily: the CLI stays self-contained for installs that never use MAX.
+  let reporter = null;
+  if (loadedJob?.job.transport === "max") {
+    const { createMaxUpdateReporter } = await import("../scripts/lib/max-update-status.mjs");
+    const { createMaxClient, resolveMaxBaseUrl } = await import("../agent/lib/max-api.ts");
+    reporter = createMaxUpdateReporter({
+      client: env.MAX_BOT_TOKEN
+        ? createMaxClient({ token: env.MAX_BOT_TOKEN, baseUrl: resolveMaxBaseUrl(env.MAX_API_BASE_URL) })
+        : null,
+      job: loadedJob.job,
+      env,
+    });
+  } else if (loadedJob) {
+    reporter = createTelegramUpdateReporter({ token: env.TELEGRAM_BOT_TOKEN, job: loadedJob.job, env });
+  }
   const terminal = createTerminalProgress({ verbose });
   const owner = telegramJobId || `cli-${process.pid}-${Date.now()}`;
   const lock = acquireUpdateLock(dataDir, owner);

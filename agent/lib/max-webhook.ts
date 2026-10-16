@@ -40,8 +40,18 @@ export interface MaxWebhookDeps {
     },
   ): Promise<unknown>;
   reset(options: { continuationToken: string; reason?: string }): Promise<unknown>;
-  greeting: string;
-  newConversation: string;
+  /** Отмена активного хода сессии (eve cancel). */
+  cancel(options: { continuationToken: string }): Promise<{ status: string }>;
+  /** Тексты и данные команд, не требующих модели. */
+  commands: {
+    greeting: string;
+    newConversation: string;
+    help(): string;
+    usage(arg: string): string;
+    stopped: string;
+    nothingRunning: string;
+    needsBridge: string;
+  };
   sendTimeoutMs?: number;
   log?: (msg: string) => void;
 }
@@ -61,6 +71,9 @@ export function maxAuth(userId: string, chatId: string | null) {
 }
 
 const ok = () => new Response("ok", { status: 200 });
+
+/** Команды, которые выполняет только мост (меню, смена модели, рестарт, обновление). */
+export const BRIDGE_COMMANDS = new Set(["/menu", "/model", "/think", "/restart", "/update"]);
 
 // Последовательная обработка событий одного пользователя: два параллельных send() в один токен
 // могли бы одновременно стартовать две сессии.
@@ -127,11 +140,25 @@ export async function handleMaxWebhook(request: Request, deps: MaxWebhookDeps): 
       const token = maxContinuationToken(event.userId);
       const command = event.kind === "message" ? event.text.split(/\s+/, 1)[0]?.toLowerCase() : null;
 
+      const c = deps.commands;
+      const arg = event.kind === "message" ? event.text.split(/\s+/).slice(1).join(" ") : "";
+
       if (event.kind === "bot_started" || command === "/start") {
-        deps.reply(event.userId, deps.greeting);
+        deps.reply(event.userId, c.greeting);
       } else if (command === "/new") {
         await deps.reset({ continuationToken: token, reason: "MAX /new command" });
-        deps.reply(event.userId, deps.newConversation);
+        deps.reply(event.userId, c.newConversation);
+      } else if (command === "/stop") {
+        const r = await deps.cancel({ continuationToken: token });
+        deps.reply(event.userId, r.status === "accepted" ? c.stopped : c.nothingRunning);
+      } else if (command === "/help") {
+        deps.reply(event.userId, c.help());
+      } else if (command === "/usage") {
+        deps.reply(event.userId, c.usage(arg));
+      } else if (command && BRIDGE_COMMANDS.has(command)) {
+        // /menu, /model, /think, /restart, /update правят .env и перезапускают сервисы —
+        // их обслуживает мост (iva-max-bridge). Раз команда дошла сюда, моста нет.
+        deps.reply(event.userId, c.needsBridge);
       } else if (event.kind === "message") {
         const sanitized = sanitizeInbound(event.text);
         const parts: string[] = [];

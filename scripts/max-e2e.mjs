@@ -37,23 +37,56 @@ function freePort() {
 
 // --- mock MAX API ---------------------------------------------------------------------
 async function startMockMax() {
-  const received = []; // {query, auth, text}
-  const state = { failNext: 0, status: 500 };
+  const received = []; // POST /messages: {query, auth, text, body}
+  const edits = []; // PUT /messages
+  const answers = []; // POST /answers
+  const deletes = [];
+  const commands = []; // PATCH /me/commands
+  const updates = []; // очередь для GET /updates: {seq, update}
+  const polls = []; // marker, с которым приходил мост
+  const state = { failNext: 0, status: 500, seq: 0, mid: 0, committed: 0 };
   const server = createHttp(async (req, res) => {
     const chunks = [];
     for await (const c of req) chunks.push(c);
+    const raw = Buffer.concat(chunks).toString();
     const url = new URL(req.url, "http://x");
+    const json = (obj, code = 200) => { res.writeHead(code, { "content-type": "application/json" }); res.end(JSON.stringify(obj)); };
+    const auth = req.headers.authorization;
+    if (auth !== TOKEN) return json({ code: "verify.token", message: "bad token" }, 401);
     if (req.method === "POST" && url.pathname === "/messages") {
       if (state.failNext > 0) { state.failNext--; res.writeHead(state.status); res.end("{}"); return; }
-      received.push({ query: url.search, auth: req.headers.authorization, text: JSON.parse(Buffer.concat(chunks).toString()).text });
-      res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({ message: { body: { mid: "m", seq: 1 } } }));
-      return;
+      const body = JSON.parse(raw);
+      const mid = `mid-${++state.mid}`;
+      received.push({ query: url.search, auth, text: body.text, body, mid });
+      return json({ message: { body: { mid, seq: state.mid } } });
+    }
+    if (req.method === "PUT" && url.pathname === "/messages") { edits.push({ mid: url.searchParams.get("message_id"), body: JSON.parse(raw) }); return json({ success: true }); }
+    if (req.method === "DELETE" && url.pathname === "/messages") { deletes.push(url.searchParams.get("message_id")); return json({ success: true }); }
+    if (req.method === "POST" && url.pathname === "/answers") { answers.push({ id: url.searchParams.get("callback_id"), body: JSON.parse(raw || "{}") }); return json({ success: true }); }
+    if (req.method === "PATCH" && url.pathname === "/me/commands") { commands.push(...(JSON.parse(raw).commands ?? [])); return json({ commands }); }
+    if (req.method === "GET" && url.pathname === "/me") return json({ user_id: 999, first_name: "Iva", username: "iva_test_bot", is_bot: true });
+    if (req.method === "GET" && url.pathname === "/subscriptions") return json({ subscriptions: [] });
+    if (req.method === "GET" && url.pathname === "/updates") {
+      const m = url.searchParams.get("marker");
+      if (m) state.committed = Math.max(state.committed, Number(m));
+      polls.push(m);
+      const from = m ? Number(m) : state.committed;
+      const deadline = Date.now() + 1500;
+      let batch = updates.filter((u) => u.seq >= from);
+      while (batch.length === 0 && Date.now() < deadline) { await sleep(50); batch = updates.filter((u) => u.seq >= from); }
+      const next = batch.length ? batch[batch.length - 1].seq + 1 : from || 1;
+      // int64 как число в JSON — так отдаёт настоящий MAX
+      return res.writeHead(200, { "content-type": "application/json" }), res.end(`{"updates":${toWire(batch.map((u) => u.update))},"marker":${next}}`);
     }
     res.writeHead(404); res.end();
   });
   await new Promise((r) => server.listen(0, "127.0.0.1", r));
-  return { received, state, url: `http://127.0.0.1:${server.address().port}`, close: () => new Promise((r) => server.close(r)) };
+  return {
+    received, edits, answers, deletes, commands, polls, state,
+    push: (update) => updates.push({ seq: ++state.seq, update }),
+    url: `http://127.0.0.1:${server.address().port}`,
+    close: () => new Promise((r) => { server.closeAllConnections?.(); server.close(r); }),
+  };
 }
 
 function startEve({ app, env, port }) {
@@ -68,6 +101,12 @@ async function stopEve(child) {
   const gone = new Promise((r) => child.once("exit", r));
   try { process.kill(-child.pid, "SIGTERM"); } catch { return; }
   if ((await Promise.race([gone, sleep(15_000).then(() => "t")])) === "t") { try { process.kill(-child.pid, "SIGKILL"); } catch {} await gone; }
+}
+function startBridge({ app, env }) {
+  const child = spawn(process.execPath, [join(app, "scripts/max-bridge.mjs")], { cwd: app, env, detached: true, stdio: ["ignore", "pipe", "pipe"] });
+  const cap = (b) => String(b).split("\n").filter(Boolean).forEach((l) => note(`[bridge] ${l}`));
+  child.stdout.on("data", cap); child.stderr.on("data", cap);
+  return child;
 }
 function run(cmd, args, opts) {
   return new Promise((res, rej) => {
@@ -191,6 +230,104 @@ async function main() {
 
     const files = JSON.stringify(await readFile(join(app, "data/max/state.json"), "utf8"));
     assert(files.length > 2, "state persisted under data/max");
+    // ── MAX-bridge: polling вместо webhook, управление из MAX ──────────────────
+    setPhase("bridge-start");
+    const callback = (payload, mid, userId = USER, id = `cb-${Math.random().toString(36).slice(2)}`) => ({
+      update_type: "message_callback", timestamp: Date.now(),
+      callback: { timestamp: Date.now(), callback_id: id, payload, user: { user_id: userId, first_name: "T", is_bot: false } },
+      message: { sender: { user_id: "999", first_name: "Iva", is_bot: true }, recipient: { chat_type: "dialog", chat_id: CHAT, user_id: null }, timestamp: Date.now(), body: { mid, seq: 1, text: "m" } },
+    });
+    const sentCount = () => maxApi.received.length;
+    let bridge = startBridge({ app, env });
+    await until(() => maxApi.commands.length > 0, "bridge registered bot commands");
+    assert(maxApi.commands.some((c) => c.name === "menu") && maxApi.commands.some((c) => c.name === "model"), "commands registered");
+
+    setPhase("bridge-text");
+    let n3 = sentCount();
+    const modelReqs = openai.requests.length;
+    maxApi.push(msg({ text: "Reply with a status word.", mid: "br1" }));
+    await until(() => sentCount() > n3, "agent reply via bridge");
+    assert(maxApi.received.at(-1).text === "REPLICA_OK", "text via bridge reaches the agent and back");
+    assert(openai.requests.length === modelReqs + 1, "exactly one model turn");
+
+    setPhase("bridge-stranger");
+    n3 = sentCount();
+    const reqs2 = openai.requests.length;
+    maxApi.push(msg({ text: "/menu", mid: "br2", userId: "222" }));
+    maxApi.push(msg({ text: "hello agent", mid: "br3", userId: "222" }));
+    await sleep(2500);
+    assert(sentCount() === n3 && openai.requests.length === reqs2, "strangers get nothing through the bridge");
+
+    setPhase("bridge-help-usage");
+    n3 = sentCount();
+    maxApi.push(msg({ text: "/help", mid: "br4" }));
+    await until(() => sentCount() > n3, "/help reply");
+    assert(/\/menu/.test(maxApi.received.at(-1).text) && /\/usage/.test(maxApi.received.at(-1).text), `help lists commands: ${maxApi.received.at(-1).text}`);
+    assert(openai.requests.length === reqs2, "/help must not spend model tokens");
+    n3 = sentCount();
+    maxApi.push(msg({ text: "/stop", mid: "br5" }));
+    await until(() => sentCount() > n3, "/stop reply");
+    assert(/Nothing is running|ничего не выполняется/i.test(maxApi.received.at(-1).text), `stop when idle: ${maxApi.received.at(-1).text}`);
+    n3 = sentCount();
+    maxApi.push(msg({ text: "/usage", mid: "br6" }));
+    await until(() => sentCount() > n3, "/usage reply");
+    assert(openai.requests.length === reqs2, "/usage must not spend model tokens");
+
+    setPhase("bridge-menu");
+    n3 = sentCount();
+    maxApi.push(msg({ text: "/menu", mid: "br7" }));
+    await until(() => sentCount() > n3, "/menu reply");
+    const menuMsg = maxApi.received.at(-1);
+    const kb = menuMsg.body.attachments?.[0];
+    assert(kb?.type === "inline_keyboard", "menu carries a MAX inline keyboard");
+    const buttons = kb.payload.buttons.flat();
+    assert(buttons.every((b) => b.type === "callback" && b.payload.length <= 1024 && b.text.length <= 128), "valid callback buttons");
+    assert(buttons.some((b) => b.payload === "iva_menu:mdl"), "Model button");
+    assert(!buttons.some((b) => /userbot|ub:o/i.test(b.payload + b.text)), "no Telegram userbot entry in MAX menu");
+    assert(menuMsg.query === `?chat_id=${CHAT}`, `menu addressed to the dialog: ${menuMsg.query}`);
+
+    setPhase("bridge-callbacks");
+    const e0 = maxApi.edits.length;
+    maxApi.push(callback("iva_menu:st:o", menuMsg.mid, USER, "cb-status"));
+    await until(() => maxApi.edits.length > e0, "menu screen edited in place");
+    assert(maxApi.edits.at(-1).mid === menuMsg.mid, "edit targets the menu message");
+    assert(maxApi.answers.some((a) => a.id === "cb-status"), "callback acknowledged via /answers");
+    const e1 = maxApi.edits.length;
+    maxApi.push(callback("iva_menu:mdl", menuMsg.mid, USER, "cb-model"));
+    await until(() => maxApi.edits.length > e1, "model wizard handed off");
+    assert(/provider|провайдер/i.test(maxApi.edits.at(-1).body.text), `wizard intro: ${maxApi.edits.at(-1).body.text}`);
+    const e2 = maxApi.edits.length;
+    maxApi.push(callback("iva_model:cancel", menuMsg.mid, USER, "cb-cancel"));
+    await until(() => maxApi.edits.length > e2, "wizard cancelled");
+    assert(/Cancelled|Отменено/.test(maxApi.edits.at(-1).body.text), "wizard cancel text");
+    const e3 = maxApi.edits.length;
+    maxApi.push(callback("iva_menu:st:o", menuMsg.mid, "222", "cb-stranger"));
+    await sleep(2500);
+    assert(maxApi.edits.length === e3, "stranger button taps are ignored");
+
+    setPhase("bridge-restart-no-replay");
+    const snap = { sent: sentCount(), reqs: openai.requests.length };
+    await stopEve(bridge);
+    maxApi.push(msg({ text: "Reply with a status word.", mid: "br8" })); // пришло, пока моста нет
+    bridge = startBridge({ app, env });
+    await until(() => sentCount() > snap.sent, "message sent while bridge was down is delivered after restart");
+    await sleep(2500);
+    assert(sentCount() === snap.sent + 1 && openai.requests.length === snap.reqs + 1, "no replay of already committed updates, no loss of the pending one");
+    await stopEve(bridge);
+
+    setPhase("bridge-agent-down");
+    // агент недоступен → мост не теряет событие и не двигает маркер дальше
+    await stopEve(eve);
+    bridge = startBridge({ app, env });
+    const lost = { sent: sentCount() };
+    maxApi.push(msg({ text: "Reply with a status word.", mid: "br9" }));
+    await sleep(4000);
+    assert(sentCount() === lost.sent, "nothing delivered while the agent is down");
+    eve = startEve({ app, env, port });
+    await until(async () => { try { return (await fetch(`${base}/`, { signal: AbortSignal.timeout(2000) })).ok; } catch { return false; } }, "eve health after bridge test", 90_000);
+    await until(() => sentCount() > lost.sent, "event delivered once the agent is back", 60_000);
+    await stopEve(bridge);
+
     console.log(`max e2e: OK (model requests: ${openai.requests.length}, MAX messages: ${maxApi.received.length})`);
   } catch (err) {
     console.error(`max e2e FAILED at phase "${phase}": ${err?.message ?? err}`);

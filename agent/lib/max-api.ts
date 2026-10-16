@@ -63,7 +63,7 @@ export interface MaxClient {
   /** Одна попытка POST /messages. Возвращает mid созданного сообщения (если MAX его вернул). */
   sendOnce(target: MaxTarget, text: string, opts?: MaxSendOptions): Promise<{ mid: string | null }>;
   /** PUT /messages. keyboard: undefined — не менять, [] — убрать, ряды — заменить. */
-  editMessage(mid: string, text: string, opts?: MaxSendOptions & { keyboard?: MaxKeyboard }): Promise<void>;
+  editMessage(mid: string, text: string | undefined, opts?: MaxSendOptions & { keyboard?: MaxKeyboard }): Promise<void>;
   deleteMessage(mid: string): Promise<void>;
   /** POST /answers — реакция на нажатие кнопки (всплывающее уведомление и/или правка сообщения). */
   answerCallback(
@@ -168,8 +168,8 @@ export function createMaxClient(opts: MaxClientOptions): MaxClient {
     });
   }
 
-  const messageBody = (text: string, o?: MaxSendOptions) => ({
-    text,
+  const messageBody = (text: string | undefined, o?: MaxSendOptions) => ({
+    ...(text !== undefined ? { text } : {}),
     ...(o?.format ? { format: o.format } : {}),
     ...(o?.keyboard !== undefined ? { attachments: attachments(o.keyboard) } : {}),
   });

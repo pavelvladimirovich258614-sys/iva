@@ -72,7 +72,7 @@ async function readBody(req) {
 }
 
 /** Стартует mock-провайдер на 127.0.0.1:0; handle: { baseUrl, requests, close }. */
-export async function startMockOpenAiServer() {
+export async function startMockOpenAiServer({ delayFor } = {}) {
   const requests = [];
   const server = createServer(async (req, res) => {
     if (req.method !== "POST" || req.url !== "/v1/chat/completions") {
@@ -90,6 +90,8 @@ export async function startMockOpenAiServer() {
     }
     requests.push(body);
     const text = chooseResponse(body);
+    const delay = delayFor?.(lastUserText(Array.isArray(body?.messages) ? body.messages : [])) ?? 0;
+    if (delay > 0) await new Promise((r) => setTimeout(r, delay));
     if (body?.stream) {
       res.writeHead(200, {
         "content-type": "text/event-stream",

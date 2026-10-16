@@ -33,6 +33,8 @@ function harness(overrides = {}) {
   const sent = [];
   const replies = [];
   const resets = [];
+  const cancels = [];
+  const cancelStatus = { v: "accepted" };
   const dir = overrides.dir ?? mkdtempSync(join(tmpdir(), "max-wh-"));
   const deps = {
     config: loadMaxConfig(env),
@@ -40,12 +42,20 @@ function harness(overrides = {}) {
     reply: (u, text) => void replies.push([u, text]),
     send: async (m, o) => void sent.push([m, o]),
     reset: async (o) => void resets.push(o),
-    greeting: "hello",
-    newConversation: "fresh",
+    cancel: async (o) => { cancels.push(o); return { status: cancelStatus.v }; },
+    commands: {
+      greeting: "hello",
+      newConversation: "fresh",
+      help: () => "HELP",
+      usage: (arg) => `USAGE[${arg}]`,
+      stopped: "stopped",
+      nothingRunning: "idle",
+      needsBridge: "needs-bridge",
+    },
     log: quiet,
     ...overrides,
   };
-  return { deps, sent, replies, resets, dir };
+  return { deps, sent, replies, resets, cancels, cancelStatus, dir };
 }
 
 test("authorized text goes to agent exactly once; identity is MAX-namespaced", async () => {
@@ -256,4 +266,28 @@ test("body limits at the handler: invalid JSON → 400, oversized stream without
   const big = new ReadableStream({ pull(c) { c.enqueue(new TextEncoder().encode("x".repeat(65536))); } });
   const r = new Request("http://x/", { method: "POST", headers: { "x-max-bot-api-secret": SECRET }, body: big, duplex: "half" });
   assert.equal((await handleMaxWebhook(r, h.deps)).status, 413);
+});
+
+test("/stop cancels the MAX session turn; /help and /usage answer without the model", async () => {
+  const h = harness();
+  await handleMaxWebhook(req(update({ mid: "s1", text: "/stop" })), h.deps);
+  h.cancelStatus.v = "no_active_turn";
+  await handleMaxWebhook(req(update({ mid: "s2", text: "/stop" })), h.deps);
+  await handleMaxWebhook(req(update({ mid: "s3", text: "/help" })), h.deps);
+  await handleMaxWebhook(req(update({ mid: "s4", text: "/usage week" })), h.deps);
+  assert.deepEqual(h.cancels.map((c) => c.continuationToken), ["dialog:111", "dialog:111"]);
+  assert.deepEqual(h.replies.map((r) => r[1]), ["stopped", "idle", "HELP", "USAGE[week]"]);
+  assert.equal(h.sent.length, 0);
+});
+
+test("bridge-only commands that reach the channel (no bridge running) get a hint, not the model", async () => {
+  const h = harness();
+  for (const [i, c] of ["/menu", "/model", "/think", "/restart", "/update"].entries()) {
+    await handleMaxWebhook(req(update({ mid: `b${i}`, text: c })), h.deps);
+  }
+  assert.equal(h.sent.length, 0);
+  assert.deepEqual(new Set(h.replies.map((r) => r[1])), new Set(["needs-bridge"]));
+  // /task, /tasks, /digest — обычные сообщения агенту (у него есть инструмент задач)
+  await handleMaxWebhook(req(update({ mid: "t1", text: "/tasks" })), h.deps);
+  assert.equal(h.sent.length, 1);
 });
