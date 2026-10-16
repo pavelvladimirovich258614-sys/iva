@@ -34,7 +34,7 @@ export function verifyMaxSecret(received: string | null, expected: string): bool
   return timingSafeEqual(digest(received), digest(expected));
 }
 
-const BIG_ID_RE = /("(?:user_id|chat_id|id|seq)"\s*:\s*)(-?\d{16,})(?=\s*[,}\]])/g;
+const BIG_ID_RE = /("(?:user_id|chat_id|id|seq|marker)"\s*:\s*)(-?\d{16,})(?=\s*[,}\]])/g;
 
 export function parseMaxJson(raw: string): unknown {
   return JSON.parse(raw.replace(BIG_ID_RE, '$1"$2"'));

@@ -11,9 +11,8 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Client, type SessionState } from "eve/client";
 import { CORE_CAP } from "../lib/core-cap.mjs";
-import { notificationChat } from "../lib/notification-chat.mjs";
+import { notifyConfigured, sendReport } from "../lib/notify.mjs";
 import { cancelTurnQuietly, resolveTurnTimeoutMs, withTurnTimeout } from "../lib/rollup-turn.mjs";
-import { sendTelegramHtml } from "../lib/telegram-send.mjs";
 
 type Period = "daily" | "weekly" | "monthly" | "yearly";
 
@@ -29,8 +28,6 @@ if (!period || !PERIODS.includes(period)) {
 const PORT = process.env.IVA_PORT ?? "8723";
 const HOST = process.env.ASSISTANT_HOST ?? `http://127.0.0.1:${PORT}`;
 const BEARER = process.env.ASSISTANT_BEARER; // needed if the prod eve channel requires auth
-const BOT = process.env.TELEGRAM_BOT_TOKEN;
-const CHAT = notificationChat();
 const VAULT = process.env.ASSISTANT_VAULT_DIR ?? "vault";
 const TZ = process.env.ASSISTANT_TIMEZONE ?? process.env.TZ ?? "UTC";
 // Format rules and the dbrain-processor prompts live in the repo, not in the vault: they
@@ -38,8 +35,8 @@ const TZ = process.env.ASSISTANT_TIMEZONE ?? process.env.TZ ?? "UTC";
 // Absolute, so the agent can read them whatever its working directory is.
 const INSTRUCTIONS = resolve(dirname(fileURLToPath(import.meta.url)), "instructions");
 
-// daily/weekly reports go to Telegram; monthly/yearly are silent (vault only).
-const POST_TO_TELEGRAM: Record<Period, boolean> = {
+// daily/weekly reports are delivered to the owner (MAX/Telegram); monthly/yearly are silent (vault only).
+const POST_REPORT: Record<Period, boolean> = {
   daily: true,
   weekly: true,
   monthly: false,
@@ -311,16 +308,14 @@ if (period === "daily") {
 
 console.log(`rollup ${period} (${today}):\n${result.message}`);
 
-// Telegram report only for daily/weekly.
-if (POST_TO_TELEGRAM[period]) {
-  if (!BOT || !CHAT) {
-    console.error(
-      `rollup ${period}: no TELEGRAM_BOT_TOKEN/TELEGRAM_DIGEST_CHAT_ID — report not sent`,
-    );
-    process.exit(1);
+// Report only for daily/weekly. An unconfigured channel is NOT an error: the rollup itself
+// (memory, vault) already succeeded and must not depend on delivery.
+if (POST_REPORT[period]) {
+  if (!notifyConfigured()) {
+    console.error(`rollup ${period}: no notification channel configured — report not sent (vault updated)`);
+    process.exit(0);
   }
-  // markdown → Telegram-HTML conversion + self-heal live in a shared helper.
-  const r = await sendTelegramHtml(BOT, CHAT, result.message);
+  const r = await sendReport(result.message);
   if (r.fellBack) {
     // HTML didn't parse — the report went out flat. Give the agent feedback in the same
     // session so it formats the next report more simply (one turn, no resend).
@@ -331,7 +326,7 @@ if (POST_TO_TELEGRAM[period]) {
     try {
       await guardedTurn(
         session,
-        `The last report failed Telegram parse_mode=HTML (${r.error}) and went out as flat text. ` +
+        `The last report failed ${r.channel} formatting (${r.error}) and went out as flat text. ` +
           "Next time format it more simply: **bold**, `code`, lists — no raw HTML.",
         "format-feedback",
       );
@@ -342,10 +337,10 @@ if (POST_TO_TELEGRAM[period]) {
     }
   }
   if (!r.ok) {
-    console.error(`rollup ${period}: Telegram send failed:`, r.error);
+    console.error(`rollup ${period}: ${r.channel} send failed:`, r.error);
     process.exit(1);
   }
-  console.log(`rollup ${period}: report sent to Telegram.`);
+  console.log(`rollup ${period}: report sent via ${r.channel}.`);
 }
 
 process.exit(0);
