@@ -25,9 +25,11 @@ export function toMaxKeyboard(replyMarkup) {
     .filter((row) => row.length > 0);
 }
 
+// retryable: временный сбой MAX API (сеть/429/5xx) — мост по нему решает, что результат не дошёл до пользователя.
 const fail = (err) => ({
   ok: false,
   description: err instanceof MaxApiError ? `${err.message}${err.code ? ` (${err.code})` : ""}` : String(err?.message ?? err),
+  retryable: err instanceof MaxApiError ? err.retryable : false,
 });
 
 /**

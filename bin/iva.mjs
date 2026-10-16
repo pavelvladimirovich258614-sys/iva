@@ -1074,7 +1074,8 @@ ${C.b}Commands:${C.x}
   ${C.c}iva reset${C.x}          full reset: clear stuck workflows and restart
   ${C.c}iva start${C.x} / ${C.c}stop${C.x}    start / stop
   ${C.c}iva usage${C.x} [win]      token usage (last|today|week|month|by-model|by-source|tail)
-  ${C.c}iva max${C.x} [check|status|whoami]  MAX channel diagnostics (token, allowlist, delivery queue)
+  ${C.c}iva max${C.x} [check|status|whoami|webhook …]  MAX channel diagnostics; \`webhook set <url>|off|status\` switches polling ↔ webhook
+  ${C.c}iva secret set${C.x} <NAME>  enter an API key / token locally (hidden input; never through chat)
   ${C.c}iva userbot${C.x} [creds|setup|status|diagnose --json|off]  personal-account userbot proxy
   ${C.c}iva logs${C.x} [poll]     agent logs (or the channel bridge) -f
   ${C.c}iva uninstall${C.x}       remove units and the command (--purge — delete code+vault)
@@ -1085,6 +1086,181 @@ ${C.b}Commands:${C.x}
 }
 
 // ── router ──────────────────────────────────────────────────────────────────
+
+// ── secrets: local-only entry of API keys / tokens ───────────────────────────
+// `iva secret set <NAME>`  reads the value WITHOUT echo (or one line from stdin) and writes it to
+// .env (0600). Keys are not typed into the MAX chat: MAX does not guarantee deleting a user's message.
+const SECRET_NAME_RE = /^[A-Z][A-Z0-9_]{2,63}$/;
+const isSecretName = (n) => SECRET_NAME_RE.test(n) && (/_(API_KEY|TOKEN|SECRET_TOKEN)$/.test(n) || n === "MAX_WEBHOOK_SECRET");
+
+function readHidden(prompt) {
+  return new Promise((resolve) => {
+    const { stdin } = process;
+    process.stdout.write(prompt);
+    stdin.setRawMode(true);
+    stdin.resume();
+    stdin.setEncoding("utf8");
+    let buf = "";
+    const onData = (chunk) => {
+      for (const c of chunk) {
+        if (c === "\r" || c === "\n" || c === "\u0004") {
+          stdin.setRawMode(false);
+          stdin.pause();
+          stdin.off("data", onData);
+          process.stdout.write("\n");
+          return resolve(buf);
+        }
+        if (c === "\u0003") {
+          stdin.setRawMode(false);
+          process.stdout.write("\n");
+          process.exit(130);
+        }
+        if (c === "\u007f" || c === "\b") buf = buf.slice(0, -1);
+        else buf += c;
+      }
+    };
+    stdin.on("data", onData);
+  });
+}
+
+async function readStdinLine() {
+  let data = "";
+  for await (const chunk of process.stdin) {
+    data += chunk;
+    if (data.includes("\n")) break;
+  }
+  return data.split(/\r?\n/)[0];
+}
+
+async function cmdSecret(args) {
+  const [sub, name, ...flags] = args;
+  if (sub !== "set" || !name) {
+    console.log("Usage: iva secret set <NAME>   (e.g. OLLAMA_API_KEY, TAVILY_API_KEY, MAX_BOT_TOKEN)\nThe value is read without echo (or from stdin); it never appears in the terminal output.");
+    process.exit(sub ? 1 : 0);
+  }
+  if (!isSecretName(name)) {
+    bad(`${name}: not an accepted secret name (expected …_API_KEY / …_TOKEN)`);
+    process.exit(1);
+  }
+  const raw = process.stdin.isTTY ? await readHidden(`${name} (input hidden): `) : await readStdinLine();
+  const value = String(raw ?? "").trim();
+  if (!/^\S{8,2048}$/.test(value)) {
+    bad("the value looks wrong (8–2048 characters, no spaces) — nothing was saved");
+    process.exit(1);
+  }
+  if (name === "MAX_BOT_TOKEN" && !flags.includes("--no-verify")) {
+    const { createMaxClient, resolveMaxBaseUrl } = await import("../agent/lib/max-api.ts");
+    try {
+      const me = await createMaxClient({ token: value, baseUrl: resolveMaxBaseUrl(readEnv().MAX_API_BASE_URL || process.env.MAX_API_BASE_URL) }).getMe();
+      ok(`MAX accepted the token — bot ${me.username ? "@" + me.username : "(no username)"}`);
+    } catch (e) {
+      bad(`MAX rejected the token (${e.message}) — nothing was saved`);
+      process.exit(1);
+    }
+  }
+  writeEnvVars({ [name]: value });
+  ok(`${name} saved to .env (value not shown). Apply: iva restart`);
+}
+
+// ── MAX webhook switch ────────────────────────────────────────────────────────
+// Exactly one transport receives events. The switch is ordered so that two never overlap:
+//   stop the bridge → change the subscription at MAX → update .env → start the bridge in the new mode.
+const MAX_UPDATE_TYPES = ["message_created", "message_callback", "bot_started"];
+
+function validateWebhookUrl(raw) {
+  let u;
+  try {
+    u = new URL(raw);
+  } catch {
+    throw new Error("not a valid URL");
+  }
+  if (u.protocol !== "https:") throw new Error("MAX requires HTTPS");
+  if (u.port && u.port !== "443") throw new Error("MAX requires port 443");
+  if (u.username || u.password || u.search || u.hash) throw new Error("the URL must not contain credentials, a query or a fragment");
+  if (/^(localhost|127\.|10\.|192\.168\.|0\.0\.0\.0|\[?::1)/i.test(u.hostname)) throw new Error("the host must be publicly reachable by MAX, not a local address");
+  if (u.pathname.length < 2) throw new Error("the URL needs a path (e.g. /max/webhook)");
+  return u.toString();
+}
+
+async function cmdMaxWebhook(args, { client, env }) {
+  const sub = args[0];
+  const flags = new Set(args.slice(1));
+  const bridge = BRIDGE_UNIT.max;
+  const useSystemd = hasSystemd() && !flags.has("--no-restart");
+  const stopBridge = () => {
+    if (useSystemd && existsSync(join(UNIT_DIR, bridge))) systemd.stop([bridge]);
+  };
+  const startBridge = () => {
+    if (useSystemd) {
+      writeUnits();
+      systemd.restart([bridge]);
+    }
+  };
+
+  if (sub === "status") {
+    const subs = await client.getSubscriptions().catch((e) => (warn(`could not read subscriptions: ${e.message}`), null));
+    ok(`MAX_INGEST=${(env.MAX_INGEST || "poll")}${env.MAX_WEBHOOK_URL ? `  MAX_WEBHOOK_URL=${env.MAX_WEBHOOK_URL}` : ""}`);
+    if (subs) ok(subs.length ? `subscriptions at MAX: ${subs.join(", ")}` : "no webhook subscription at MAX (polling mode)");
+    const port = Number(env.MAX_BRIDGE_PORT || 8725);
+    const hz = await fetch(`http://127.0.0.1:${port}/healthz`, { signal: AbortSignal.timeout(2000) }).then((r) => r.json(), () => null);
+    (hz ? ok : warn)(hz ? `bridge listener is up on 127.0.0.1:${port} (mode ${hz.mode})` : `no webhook listener on 127.0.0.1:${port} (normal in polling mode)`);
+    return;
+  }
+
+  if (sub === "set") {
+    const url = (() => {
+      try {
+        return validateWebhookUrl(args[1] || "");
+      } catch (e) {
+        bad(`webhook URL rejected: ${e.message}`);
+        process.exit(1);
+      }
+    })();
+    if (!(env.MAX_WEBHOOK_SECRET || "").trim()) {
+      bad("MAX_WEBHOOK_SECRET is empty — run: iva config");
+      process.exit(1);
+    }
+    warn(`This registers ${url} at MAX: the bot will receive events THERE and polling will stop.`);
+    if (!flags.has("--yes") && !(await confirm("Register the webhook now?", false))) return console.log("Cancelled.");
+    const existing = await client.getSubscriptions();
+    const others = existing.filter((x) => x !== url);
+    if (others.length && !flags.has("--replace")) {
+      bad(`other subscriptions exist (${others.join(", ")}) — re-run with --replace to remove them`);
+      process.exit(1);
+    }
+    stopBridge(); // no transport runs while the subscription changes
+    try {
+      for (const old of others) await client.unsubscribe(old);
+      await client.subscribe({ url, updateTypes: MAX_UPDATE_TYPES, secret: env.MAX_WEBHOOK_SECRET });
+    } catch (e) {
+      bad(`MAX did not accept the subscription: ${e.message}`);
+      startBridge(); // back to the previous mode
+      process.exit(1);
+    }
+    writeEnvVars({ MAX_INGEST: "webhook", MAX_WEBHOOK_URL: url });
+    startBridge();
+    ok(`webhook registered: ${url} — bridge restarted in webhook mode (listener 127.0.0.1:${env.MAX_BRIDGE_PORT || 8725}${"/max/webhook"})`);
+    return;
+  }
+
+  if (sub === "off") {
+    const targets = flags.has("--all") ? await client.getSubscriptions() : [env.MAX_WEBHOOK_URL].filter(Boolean);
+    stopBridge();
+    try {
+      for (const t of targets) await client.unsubscribe(t);
+    } catch (e) {
+      bad(`MAX did not remove the subscription: ${e.message} — the bridge stays stopped; fix and re-run`);
+      process.exit(1);
+    }
+    writeEnvVars({ MAX_INGEST: "poll", MAX_WEBHOOK_URL: "" });
+    startBridge();
+    ok("webhook removed — bridge restarted in polling mode");
+    return;
+  }
+  console.log("Usage: iva max webhook <set <https-url> [--yes] [--replace] | off [--all] | status>   (add --no-restart to skip service changes)");
+  process.exit(sub ? 1 : 0);
+}
+
 // ── MAX channel diagnostics ───────────────────────────────────────────────
 // `iva max check`   token, bot identity, allowlist, webhook subscription, bridge/agent services
 // `iva max status`  outbound delivery queue of the running agent (dead items = undelivered replies)
@@ -1099,6 +1275,7 @@ async function cmdMax(args) {
   }
   const { createMaxClient, resolveMaxBaseUrl } = await import("../agent/lib/max-api.ts");
   const client = createMaxClient({ token, baseUrl: resolveMaxBaseUrl(env.MAX_API_BASE_URL) });
+  if (sub === "webhook") return cmdMaxWebhook(args.slice(1), { client, env });
   if (sub === "status") {
     const port = (env.IVA_PORT || DEFAULT_PORT).trim();
     const res = await fetch(`http://127.0.0.1:${port}/eve/v1/max/status`, {
@@ -1108,6 +1285,8 @@ async function cmdMax(args) {
     if (!res.ok) return bad(`agent did not answer the status request (${res.status}) — is iva.service running with MAX enabled?`);
     const st = await res.json();
     ok(`accepted events: ${st.acceptedEvents} · queued replies: ${st.queued} · undelivered (dead): ${st.dead}`);
+    if (st.health?.persistFailing) warn(`state.json cannot be written (${st.health.unpersistedEvents} unacknowledged event(s)) — check disk space/permissions of data/max`);
+    for (const f of st.health?.corruptFiles ?? []) bad(`${f} was corrupt and its contents are lost (moved aside as *.corrupt-*)`);
     for (const d of st.deadItems) warn(`dead ${d.id} user=${d.userId} attempts=${d.attempts} status=${d.lastError?.status ?? "network"} reason=${d.lastError?.name}`);
     return;
   }
@@ -1138,6 +1317,11 @@ async function cmdMax(args) {
     else ok(subs.length ? `webhook subscription: ${subs.join(", ")}` : "no webhook subscription (polling mode)");
   } catch (e) {
     warn(`could not read subscriptions: ${e.message}`);
+  }
+  if ((env.MAX_INGEST || "poll") === "webhook") {
+    const port = Number(env.MAX_BRIDGE_PORT || 8725);
+    const hz = await fetch(`http://127.0.0.1:${port}/healthz`, { signal: AbortSignal.timeout(2000) }).then((r) => r.json(), () => null);
+    (hz ? ok : warn)(hz ? `webhook listener is up on 127.0.0.1:${port}` : `webhook listener is NOT answering on 127.0.0.1:${port} — is ${BRIDGE_UNIT.max} running?`);
   }
   if (hasSystemd()) for (const svc of SERVICES) (systemd.isActive(svc) ? ok : warn)(`${svc} ${systemd.isActive(svc) ? "active" : "NOT active"}`);
 }
@@ -1326,6 +1510,7 @@ const cmds = {
   stop: cmdStop,
   logs: cmdLogs,
   max: cmdMax,
+  secret: cmdSecret,
   uninstall: cmdUninstall,
   version: cmdVersion,
   tree: showTree, // play the ANSI tree (wind animation)

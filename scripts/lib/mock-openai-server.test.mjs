@@ -67,8 +67,18 @@ test("marker is echoed back from the replayed transcript", async () => {
 test("unknown routes return 404", async () => {
   const mock = await startMockOpenAiServer();
   try {
-    const res = await fetch(`${mock.baseUrl}/models`);
+    const res = await fetch(`${mock.baseUrl}/embeddings`);
     assert.equal(res.status, 404);
+  } finally {
+    await mock.close();
+  }
+});
+
+test("GET /models lists the replica model and one alternative (for the /model wizard e2e)", async () => {
+  const mock = await startMockOpenAiServer();
+  try {
+    const body = await (await fetch(`${mock.baseUrl}/models`)).json();
+    assert.deepEqual(body.data.map((m) => m.id), ["iva-replica", "iva-alt"]);
   } finally {
     await mock.close();
   }

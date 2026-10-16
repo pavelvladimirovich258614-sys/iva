@@ -1,7 +1,8 @@
-# systemd USER unit — MAX polling-мост (GET /updates → локальный канал агента + управление /menu,/model…).
-#
-# Нужен, когда MAX подключён без публичного HTTPS (по умолчанию). Если вы настроили webhook
-# MAX (MAX_INGEST=webhook), этот сервис не запускается.
+# systemd USER unit — MAX-мост: единая точка входа событий и локального управления Ивой.
+#   MAX_INGEST=poll     long polling GET /updates (без публичного HTTPS)
+#   MAX_INGEST=webhook  HTTP-приёмник на 127.0.0.1:MAX_BRIDGE_PORT (путь /max/webhook); наружу его
+#                       публикует reverse proxy (см. deploy/nginx-max-webhook.conf.example)
+# Работает от обычного пользователя (systemctl --user, systemd-run --user), без root.
 # Плейсхолдеры __PROJECT_DIR__/__NODE_BIN__ подставляет `iva _install-units`.
 [Unit]
 Description=Iva MAX polling bridge (GET /updates → local agent channel)
@@ -19,6 +20,9 @@ ExecStart=__NODE_BIN__ --env-file=.env scripts/max-bridge.mjs
 ExecStartPost=-/usr/bin/systemctl --user enable --now iva-update-check.timer
 Restart=always
 RestartSec=3
+# Код 78 — конфликт конфигурации (второй транспорт / активная webhook-подписка при polling):
+# перезапуск его не лечит, а только долбил бы API.
+RestartPreventExitStatus=78
 
 [Install]
 WantedBy=default.target

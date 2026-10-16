@@ -28,6 +28,10 @@ export function createModelWizard({
   reply,
   // Секреты (API-ключи) принимаем только в личном диалоге. Telegram: id личных чатов положительны.
   isPrivate = (st) => Number(st.chatId) > 0,
+  // Принимать ли API-ключи обычным сообщением в чат. Telegram: да (сообщение удаляется сразу).
+  // MAX: нет по умолчанию — удаление сообщения пользователя там не доказано, ключи вводятся
+  // локально (`iva secret set <ИМЯ>`).
+  secretsInChat = true,
 }) {
   // ── /model & /think wizard (out-of-band, inline keyboards) ─────────────────
   // State lives in memory keyed by `${chatId}:${userId}`; each flow edits ONE message
@@ -136,6 +140,13 @@ export function createModelWizard({
     endWizard(st, tr(
       "API keys are secrets — open a private chat with me and set the key there.",
       "Ключи — это секрет. Открой личный чат со мной и введи ключ там.",
+    ), menuRow());
+
+  // Ключ вводится локально: чат не место для секретов, пока гарантированное удаление не доказано.
+  const refuseSecretInChat = (st, cat) =>
+    endWizard(st, tr(
+      `${cat.label} needs an API key. Keys are NOT entered in chat — on the server run:\n  iva secret set ${cat.keyVar}\nthen send /model again.`,
+      `Для ${cat.label} нужен API-ключ. Ключи в чат не вводятся — на сервере выполни:\n  iva secret set ${cat.keyVar}\nи снова отправь /model.`,
     ), menuRow());
 
   function effortRows(ns, withKeep, efforts) {
@@ -247,6 +258,7 @@ export function createModelWizard({
       st.reenterKey = null;
       // В группе ключ вводить нельзя (его не удалить) — отказ до установки awaitText.
       if (!isPrivateChat(st)) return refuseSecretInGroup(st);
+    if (!secretsInChat) return refuseSecretInChat(st, cat);
       // awaitText обобщает старый awaitKey (см. handleControl): диспатчер по pending.awaitText
       // отдаёт следующий текст этому визарду (handleKeyMessage), а не eve.
       st.awaitText = { kind: "apikey", secret: true, data: {} };

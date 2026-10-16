@@ -22,24 +22,40 @@ const numEnv = (name: string) => {
   return Number.isFinite(n) && n > 0 ? n : undefined;
 };
 
-// Всё тяжёлое (файлы, клиент, таймеры) создаётся только при включённом MAX.
-const runtime = config
-  ? (() => {
-      const store = createMaxStore({ dir: maxDataDir() });
-      const client = createMaxClient({
-        token: config.token,
-        baseUrl: resolveMaxBaseUrl(process.env.MAX_API_BASE_URL),
-      });
-      const outbox = createMaxOutbox({
-        store,
-        client,
-        backoffBaseMs: numEnv("MAX_OUTBOX_BACKOFF_MS"),
-        minIntervalMs: numEnv("MAX_MIN_SEND_INTERVAL_MS"),
-      });
-      outbox.start(); // возобновляет недоставленное с прошлого запуска
-      return { store, outbox };
-    })()
-  : null;
+// Всё тяжёлое (файлы, клиент, таймеры) создаётся только при включённом MAX и лениво: если хранилище
+// нельзя открыть (нет прав на data/max, нечитаемый файл), приложение Eve в целом остаётся живым,
+// а MAX-роуты отвечают 503 и логируют причину — вместо ложного 404/200. Повторная попытка — на
+// следующем запросе.
+type Runtime = { store: ReturnType<typeof createMaxStore>; outbox: ReturnType<typeof createMaxOutbox> };
+let runtimeCache: Runtime | null = null;
+function getRuntime(): Runtime | null {
+  if (!config) return null;
+  if (runtimeCache) return runtimeCache;
+  const store = createMaxStore({ dir: maxDataDir() });
+  const client = createMaxClient({
+    token: config.token,
+    baseUrl: resolveMaxBaseUrl(process.env.MAX_API_BASE_URL),
+  });
+  const outbox = createMaxOutbox({
+    store,
+    client,
+    backoffBaseMs: numEnv("MAX_OUTBOX_BACKOFF_MS"),
+    minIntervalMs: numEnv("MAX_MIN_SEND_INTERVAL_MS"),
+  });
+  outbox.start(); // возобновляет недоставленное с прошлого запуска
+  runtimeCache = { store, outbox };
+  return runtimeCache;
+}
+function tryRuntime(): Runtime | null | "unavailable" {
+  try {
+    return getRuntime();
+  } catch (err) {
+    console.error("[max] storage unavailable:", (err as Error).message);
+    return "unavailable";
+  }
+}
+// Поднимаем сразу, чтобы недоставленные ответы прошлого запуска ушли без ожидания первого запроса.
+tryRuntime();
 
 /** Тексты служебных команд; функции — язык берётся в момент вызова (tr), не при импорте. */
 const commands = () => ({
@@ -68,7 +84,8 @@ const commands = () => ({
 
 /** Ответ агента → durable outbox. Сбой постановки громко логируется: пользователь ответа не получит. */
 function reply(state: MaxChannelState, text: string) {
-  if (!runtime || !text.trim()) return;
+  const runtime = tryRuntime();
+  if (!runtime || runtime === "unavailable" || !text.trim()) return;
   try {
     runtime.outbox.enqueue(state.userId, text);
   } catch (err) {
@@ -86,7 +103,9 @@ export default defineChannel<MaxChannelState, { state: MaxChannelState }>({
   context: (state) => ({ state }),
   routes: [
     POST<MaxChannelState>("/eve/v1/max", async (request, { send, reset, cancel }) => {
-      if (!config || !runtime) return new Response("not found", { status: 404 }); // MAX выключен
+      if (!config) return new Response("not found", { status: 404 }); // MAX выключен
+      const runtime = tryRuntime();
+      if (runtime === "unavailable" || !runtime) return new Response("storage unavailable", { status: 503 });
       return handleMaxWebhook(request, {
         config,
         store: runtime.store,
@@ -100,10 +119,12 @@ export default defineChannel<MaxChannelState, { state: MaxChannelState }>({
     }),
     // Сброс сессии MAX-диалога для моста (/restart): тот же секрет, что и у webhook.
     POST<MaxChannelState>("/eve/v1/max/reset", async (request, { reset }) => {
-      if (!config || !runtime) return new Response("not found", { status: 404 });
+      if (!config) return new Response("not found", { status: 404 });
       if (!verifyMaxSecret(request.headers.get(MAX_SECRET_HEADER), config.webhookSecret)) {
         return new Response("unauthorized", { status: 401 });
       }
+      const runtime = tryRuntime();
+      if (runtime === "unavailable" || !runtime) return new Response("storage unavailable", { status: 503 });
       const body = await readBodyLimited(request, { maxBytes: 4096, timeoutMs: 5000 });
       let userId = "";
       try {
@@ -117,16 +138,19 @@ export default defineChannel<MaxChannelState, { state: MaxChannelState }>({
     }),
     // Диагностика очереди: тот же секрет, что и у webhook; без текстов сообщений.
     GET<MaxChannelState>("/eve/v1/max/status", async (request) => {
-      if (!config || !runtime) return new Response("not found", { status: 404 });
+      if (!config) return new Response("not found", { status: 404 });
       if (!verifyMaxSecret(request.headers.get(MAX_SECRET_HEADER), config.webhookSecret)) {
         return new Response("unauthorized", { status: 401 });
       }
+      const runtime = tryRuntime();
+      if (runtime === "unavailable" || !runtime) return new Response("storage unavailable", { status: 503 });
       const s = runtime.store.stats();
       return Response.json({
         acceptedEvents: s.accepted,
         queued: s.queued,
         dead: s.dead,
         oldestQueuedAt: s.oldestQueuedAt,
+        health: s.health,
         deadItems: s.deadItems.map(({ id, userId, attempts, textLength, lastError, createdAt }) => ({
           id,
           userId,

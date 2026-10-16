@@ -75,6 +75,11 @@ async function readBody(req) {
 export async function startMockOpenAiServer({ delayFor } = {}) {
   const requests = [];
   const server = createServer(async (req, res) => {
+    if (req.method === "GET" && req.url === "/v1/models") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ object: "list", data: [{ id: MODEL }, { id: "iva-alt" }] }));
+      return;
+    }
     if (req.method !== "POST" || req.url !== "/v1/chat/completions") {
       res.writeHead(404, { "content-type": "application/json" });
       res.end(JSON.stringify({ error: { message: `no route: ${req.method} ${req.url}` } }));

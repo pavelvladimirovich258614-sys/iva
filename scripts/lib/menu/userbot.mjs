@@ -195,6 +195,14 @@ export default {
           [ctx.backRow(PARENT)],
         );
       }
+      if (!ctx.secretsInChat()) {
+        st.awaitText = null;
+        return ctx.flows.screen(
+          st,
+          ctx.tr("Credentials are NOT entered in chat. On the server run:  iva userbot creds", "Ключи в чат не вводятся. На сервере выполни:  iva userbot creds"),
+          [ctx.backRow(PARENT)],
+        );
+      }
       st.data.ub = {};
       return promptCred(st, ctx, "api_id");
     }

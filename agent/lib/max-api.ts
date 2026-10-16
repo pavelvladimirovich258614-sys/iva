@@ -77,6 +77,10 @@ export interface MaxClient {
   setCommands(commands: Array<{ name: string; description: string }>): Promise<void>;
   /** GET /subscriptions → список URL активных webhook-подписок. */
   getSubscriptions(): Promise<string[]>;
+  /** POST /subscriptions — регистрирует webhook (после этого MAX шлёт события только туда). */
+  subscribe(opts: { url: string; updateTypes: string[]; secret: string }): Promise<void>;
+  /** DELETE /subscriptions?url=… — снимает webhook (после этого снова доступен long polling). */
+  unsubscribe(url: string): Promise<void>;
 }
 
 /** Базовый URL: только https; http допустим лишь для loopback (тестовые mock-серверы). */
@@ -221,6 +225,14 @@ export function createMaxClient(opts: MaxClientOptions): MaxClient {
     },
     async setCommands(commands) {
       await call("PATCH", "/me/commands", { body: { commands: commands.slice(0, 32) } });
+    },
+    async subscribe({ url, updateTypes, secret }) {
+      const out = await call("POST", "/subscriptions", { body: { url, update_types: updateTypes, secret } });
+      if (out && out.success === false) throw new MaxApiError(`MAX refused the subscription${out.message ? `: ${String(out.message).slice(0, 200)}` : ""}`, 200, false);
+    },
+    async unsubscribe(url) {
+      const out = await call("DELETE", "/subscriptions", { query: { url } });
+      if (out && out.success === false) throw new MaxApiError(`MAX refused to remove the subscription${out.message ? `: ${String(out.message).slice(0, 200)}` : ""}`, 200, false);
     },
     async getSubscriptions() {
       const out = await call("GET", "/subscriptions");

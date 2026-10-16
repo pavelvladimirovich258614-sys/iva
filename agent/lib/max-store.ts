@@ -1,11 +1,18 @@
 // Устойчивое к рестарту состояние канала MAX под data/ (untracked, 0600):
 //   state.json  — принятые события (дедуп) и последний известный chat_id диалога пользователя;
 //   outbox.json — ответы, ожидающие доставки (очередь с retry/backoff и диагностикой).
-// Запись атомарная (tmp + rename). Процесс — единственный владелец файлов; параллельный запуск
-// двух экземпляров на одном data/ не поддерживается. Внутри процесса все операции синхронные,
-// поэтому гонок между async-обработчиками нет.
+// Запись атомарная и долговечная: tmp-файл → fsync → rename → fsync каталога. Процесс — единственный
+// владелец файлов; параллельный запуск двух экземпляров на одном data/ не поддерживается. Внутри
+// процесса все операции синхронные, поэтому гонок между async-обработчиками нет.
+//
+// Контракт подтверждения (commit): если запись state.json не удалась, commit() БРОСАЕТ — вызывающий
+// не вправе считать подтверждение сохранённым. Событие при этом остаётся помеченным в памяти
+// процесса («принято, но не записано»): повторная доставка в этом же процессе не запустит второй
+// ход, а claim() сначала попробует дописать файл. Если процесс умрёт до успешной записи —
+// повторная доставка запустит ход ещё раз (at-least-once; транзакции между сохранением запуска в Eve
+// и записью дедупликации нет, exactly-once не обещается).
 
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 export const ACCEPTED_TTL_MS = 7 * 24 * 60 * 60_000;
@@ -51,10 +58,28 @@ export interface MaxStore {
   queuedFor(userId: string): OutboxItem[];
   complete(id: string): void;
   fail(id: string, error: { status: number | null; name: string }, nextAt: number | null): OutboxItem | null;
-  stats(): { accepted: number; queued: number; dead: number; oldestQueuedAt: number | null; deadItems: OutboxItem[] };
+  stats(): {
+    accepted: number;
+    queued: number;
+    dead: number;
+    oldestQueuedAt: number | null;
+    deadItems: OutboxItem[];
+    /** Состояние хранилища: битые файлы (данные потеряны) и невозможность записи подтверждений. */
+    health: { corruptFiles: string[]; persistFailing: boolean; unpersistedEvents: number };
+  };
 }
 
-function readJson<T>(file: string, fallback: T, log: (m: string) => void): T {
+/**
+ * Читает JSON-файл. Нет файла → fallback. Нечитаемый (EACCES…) → исключение (хозяин состояния не
+ * должен молча стартовать с пустого). Битый/неверной формы → файл откладывается в *.corrupt-<ts>,
+ * вызывается onCorrupt (попадает в health/stats), стартуем с fallback.
+ */
+export function readJsonFile<T>(
+  file: string,
+  fallback: T,
+  onCorrupt: (file: string, aside: string) => void = () => {},
+  isShape: (v: unknown) => boolean = (v) => typeof v === "object" && v !== null && !Array.isArray(v),
+): T {
   let raw: string;
   try {
     raw = readFileSync(file, "utf8");
@@ -63,25 +88,53 @@ function readJson<T>(file: string, fallback: T, log: (m: string) => void): T {
     throw err;
   }
   try {
-    return JSON.parse(raw) as T;
+    const parsed = JSON.parse(raw);
+    if (!isShape(parsed)) throw new Error("unexpected shape");
+    return parsed as T;
   } catch {
-    // Битый файл не затираем молча: откладываем в сторону и стартуем с пустого.
     const aside = `${file}.corrupt-${Date.now()}`;
     try {
       renameSync(file, aside);
     } catch {
       /* best-effort */
     }
-    log(`state file was corrupt, moved to ${aside}`);
+    onCorrupt(file, aside);
     return fallback;
   }
 }
 
-function writeJsonAtomic(file: string, value: unknown) {
-  mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
+/** tmp → fsync → rename → fsync каталога. Бросает при любой ошибке; файл остаётся прежним или новым целиком. */
+export function writeJsonAtomic(file: string, value: unknown) {
+  const dir = dirname(file);
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
   const tmp = `${file}.tmp-${process.pid}`;
-  writeFileSync(tmp, JSON.stringify(value), { mode: 0o600 });
-  renameSync(tmp, file);
+  try {
+    const fd = openSync(tmp, "w", 0o600);
+    try {
+      writeSync(fd, JSON.stringify(value));
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+    renameSync(tmp, file);
+  } catch (err) {
+    try {
+      unlinkSync(tmp); // не оставляем мусор; прежний файл не тронут
+    } catch {
+      /* tmp мог не появиться */
+    }
+    throw err;
+  }
+  try {
+    const dfd = openSync(dir, "r");
+    try {
+      fsyncSync(dfd);
+    } finally {
+      closeSync(dfd);
+    }
+  } catch {
+    /* fsync каталога поддерживается не везде; сам rename уже выполнен */
+  }
 }
 
 export function maxDataDir(env: Record<string, string | undefined> = process.env): string {
@@ -93,29 +146,40 @@ export function createMaxStore({
   dir,
   now = Date.now,
   log = (m: string) => console.error(`[max] ${m}`),
+  io = { writeJson: writeJsonAtomic },
 }: {
   dir: string;
   now?: () => number;
   log?: (m: string) => void;
+  /** Подмена записи — для тестов отказов диска. */
+  io?: { writeJson(file: string, value: unknown): void };
 }): MaxStore {
   const stateFile = join(dir, "state.json");
   const outboxFile = join(dir, "outbox.json");
-  const state = readJson<StateFile>(stateFile, { accepted: {}, dialogs: {} }, log);
+  const corrupt: string[] = [];
+  const onCorrupt = (file: string, aside: string) => {
+    corrupt.push(file);
+    log(`ERROR: ${file} was corrupt and was moved to ${aside}; its contents are lost (dedup history / queued replies)`);
+  };
+  const state = readJsonFile<StateFile>(stateFile, { accepted: {}, dialogs: {} }, onCorrupt);
   state.accepted ??= {};
   state.dialogs ??= {};
-  const outbox = readJson<OutboxFile>(outboxFile, { seq: 0, items: [] }, log);
+  const outbox = readJsonFile<OutboxFile>(outboxFile, { seq: 0, items: [] }, onCorrupt);
   outbox.items ??= [];
   // pending живёт только в памяти: после рестарта обработчиков в полёте нет.
   const pending = new Set<string>();
+  // Принято в памяти, но state.json ещё не записан (см. контракт commit в шапке файла).
+  const unpersisted = new Set<string>();
+  let stateDirty = false;
 
-  const saveState = () => {
-    try {
-      writeJsonAtomic(stateFile, state);
-    } catch (err) {
-      log(`cannot persist state.json: ${(err as Error).message}`);
-    }
+  /** Записывает state.json, если есть несохранённое. Бросает при ошибке (состояние остаётся «грязным»). */
+  const flushState = () => {
+    if (!stateDirty) return;
+    io.writeJson(stateFile, state);
+    stateDirty = false;
+    unpersisted.clear();
   };
-  const saveOutbox = () => writeJsonAtomic(outboxFile, outbox); // сбой записи outbox наружу: ответ нельзя считать принятым
+  const saveOutbox = () => io.writeJson(outboxFile, outbox); // сбой записи outbox наружу: ответ нельзя считать принятым
 
   function pruneAccepted() {
     const t = now();
@@ -138,7 +202,12 @@ export function createMaxStore({
 
   return {
     claim(key) {
-      if (key in state.accepted) return "done";
+      if (key in state.accepted) {
+        // Подтверждение было принято в памяти, но не записано: сначала доводим до диска.
+        // Не удалось — бросаем: «done» без записи было бы ложным подтверждением.
+        if (unpersisted.has(key)) flushState();
+        return "done";
+      }
       if (pending.has(key)) return "in_flight";
       pending.add(key);
       return "new";
@@ -146,8 +215,10 @@ export function createMaxStore({
     commit(key) {
       pending.delete(key);
       state.accepted[key] = now();
+      unpersisted.add(key);
       pruneAccepted();
-      saveState();
+      stateDirty = true;
+      flushState(); // бросает: подтверждение НЕ сохранено, но событие помечено в памяти (дубль в этом процессе не пойдёт)
     },
     abort(key) {
       pending.delete(key);
@@ -155,7 +226,13 @@ export function createMaxStore({
     rememberDialog(userId, chatId) {
       if (!chatId || state.dialogs[userId] === chatId) return;
       state.dialogs[userId] = chatId;
-      saveState();
+      stateDirty = true;
+      try {
+        flushState();
+      } catch (err) {
+        // chat_id — кэш адресации (есть запасной user_id); не повод отказывать в приёме. Допишется позже.
+        log(`cannot persist state.json (dialog cache): ${(err as Error).message}`);
+      }
     },
     dialogChatId: (userId) => state.dialogs[userId] ?? null,
     enqueue(userId, chunks) {
@@ -214,6 +291,7 @@ export function createMaxStore({
         dead: deadItems.length,
         oldestQueuedAt: queued.length ? Math.min(...queued.map((i) => i.createdAt)) : null,
         deadItems,
+        health: { corruptFiles: [...corrupt], persistFailing: stateDirty, unpersistedEvents: unpersisted.size },
       };
     },
   };

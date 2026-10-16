@@ -59,6 +59,8 @@ export function createMenu({ flows, tg, deps, screens = SCREENS }) {
     lang: "ru",
     tr: (en, ru) => (ctx.lang === "ru" ? ru : en),
     getLang: () => ctx.lang,
+    // Принимает ли этот транспорт секреты обычными сообщениями (MAX: нет, вводятся локально через CLI).
+    secretsInChat: () => deps.secretsInChat !== false,
     btn: (text, data) => ({ text, callback_data: data }),
     // Переключить экран и перерисовать. Страницу НЕ сбрасывает — этим управляет вызывающий
     // (движок сбрасывает page на o-верб; экраны, зовущие show для под-экранов, — сами).

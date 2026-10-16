@@ -3,11 +3,14 @@
 //
 // Контракт ACK: HTTP 200 возвращается только когда событие надёжно принято —
 //   • для текста: eve send() вернулся (workflow run/hook сохранён в durable-хранилище eve;
-//     send НЕ ждёт генерацию модели) и событие записано в state.json;
+//     send НЕ ждёт генерацию модели) и подтверждение записано в state.json (fsync);
 //   • для /start, /new, bot_started: ответ записан в durable outbox.
 // Любая ошибка до этого момента → 5xx (MAX повторит доставку), отметка in-flight снимается.
-// Дубль, пока первый запрос ещё в работе → 503 (а не ложный 200). Гарантия — at-least-once:
-// падение процесса между send() и записью в state.json приведёт к повторной обработке.
+// Если действие выполнено, а подтверждение записать не удалось (диск), отвечаем 5xx и НЕ снимаем
+// отметку «принято» в памяти: повтор в этом процессе дописывает файл и отвечает 200 без второго
+// хода. Транзакции между сохранением запуска в Eve и записью дедупликации нет, поэтому гарантия —
+// at-least-once: падение процесса между send() и записью приведёт к повторной обработке.
+// Дубль, пока первый запрос ещё в работе → 503 (а не ложный 200).
 
 import { hasInboundAttackSignal, sanitizeInbound } from "./security-gate.ts";
 import { readBodyLimited } from "./max-body.ts";
@@ -131,7 +134,14 @@ export async function handleMaxWebhook(request: Request, deps: MaxWebhookDeps): 
   }
 
   return serialize(event.userId, async () => {
-    const claim = store.claim(event.dedupKey);
+    let claim: ReturnType<MaxStore["claim"]>;
+    try {
+      claim = store.claim(event.dedupKey);
+    } catch (err) {
+      // «Принято, но не записано» и дописать по-прежнему нельзя: подтверждать нельзя.
+      log(`cannot persist earlier acknowledgement: ${(err as Error).message}`.slice(0, 300));
+      return new Response("persist failed", { status: 500 });
+    }
     if (claim === "done") return ok();
     if (claim === "in_flight") {
       // Первый запрос ещё идёт: подтверждать нельзя — он может упасть. Просим повторить.
@@ -187,13 +197,20 @@ export async function handleMaxWebhook(request: Request, deps: MaxWebhookDeps): 
           deps.sendTimeoutMs ?? 20_000,
         );
       }
-      store.commit(event.dedupKey);
-      return ok();
     } catch (err) {
       // Не принято надёжно → снимаем in-flight и просим MAX повторить доставку.
       store.abort(event.dedupKey);
       log(`handling failed: ${(err as Error).name}: ${(err as Error).message}`.slice(0, 300));
       return new Response("retry", { status: 500 });
     }
+    try {
+      store.commit(event.dedupKey);
+    } catch (err) {
+      // Действие выполнено (Eve принял запуск / ответ в outbox), но подтверждение не записано.
+      // НЕ abort: в памяти событие остаётся «принятым», чтобы повтор не запустил второй ход.
+      log(`ACK NOT PERSISTED for an executed event: ${(err as Error).message}; asking MAX to redeliver`.slice(0, 300));
+      return new Response("persist failed", { status: 500 });
+    }
+    return ok();
   });
 }

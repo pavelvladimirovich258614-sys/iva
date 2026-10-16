@@ -128,10 +128,10 @@ test("explicit IVA_CHANNELS wins over leftover tokens (Telegram can be re-enable
   assert.deepEqual(channelServices({ ...env, IVA_CHANNELS: "max,telegram" }), ["iva.service", "iva-telegram-poll.service", "iva-max-bridge.service"]);
 });
 
-test("legacy installs without IVA_CHANNELS are inferred from tokens; webhook ingest has no bridge; empty config stays legacy", () => {
+test("legacy installs without IVA_CHANNELS are inferred from tokens; webhook ingest also runs the bridge; empty config stays legacy", () => {
   assert.deepEqual(channelServices({ TELEGRAM_BOT_TOKEN: "123:abc" }), ["iva.service", "iva-telegram-poll.service"]);
   assert.deepEqual(channelServices({ MAX_BOT_TOKEN: "t", MAX_WEBHOOK_SECRET: "s" }), ["iva.service", "iva-max-bridge.service"]);
-  assert.deepEqual(channelServices({ IVA_CHANNELS: "max", MAX_BOT_TOKEN: "t", MAX_WEBHOOK_SECRET: "s", MAX_INGEST: "webhook" }), ["iva.service"]);
+  assert.deepEqual(channelServices({ IVA_CHANNELS: "max", MAX_BOT_TOKEN: "t", MAX_WEBHOOK_SECRET: "s", MAX_INGEST: "webhook" }), ["iva.service", "iva-max-bridge.service"]); // мост принимает и webhook
   assert.deepEqual(channelServices({}), ["iva.service", "iva-telegram-poll.service"]);
   assert.equal(configuredChannels({ IVA_CHANNELS: "garbage" }).telegram, true); // unknown value → inferred (legacy default)
 });

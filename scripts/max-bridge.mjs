@@ -1,12 +1,19 @@
 #!/usr/bin/env node
-// MAX bridge: long-polling GET /updates → локальный канал агента + локальное управление (/menu,
-// /model, /think, /restart, /update и кнопки). Это MAX-аналог telegram-poll.mjs для установки
-// без публичного HTTPS: webhook MAX требует домен и TLS на 443, polling — нет.
+// MAX bridge — единая точка входа событий MAX и локального управления Ивой.
 //
 //   node --env-file=.env scripts/max-bridge.mjs
 //
-// Агент один: сообщения пересылаются в тот же POST /eve/v1/max (allowlist, дедуп, sanitize, outbox).
-// Webhook-подписка и polling взаимоисключающи — при старте мост предупреждает, если подписка есть.
+// MAX_INGEST=webhook  (рекомендуется для постоянной эксплуатации): мост слушает HTTP на
+//                     127.0.0.1:MAX_BRIDGE_PORT, путь /max/webhook; наружу публикуется reverse proxy
+//                     (HTTPS:443) ТОЛЬКО на этот путь. Подписку на стороне MAX создаёт
+//                     `iva max webhook set <url>`.
+// MAX_INGEST=poll     (по умолчанию, для разработки/без домена): long polling GET /updates.
+//
+// Оба режима используют один и тот же process(update) (scripts/lib/max-bridge-core.mjs): текст и
+// /new /stop /help /usage /task /tasks /digest уходят в канал агента (POST /eve/v1/max на loopback),
+// /menu /model /think /restart /update и кнопки выполняются здесь — нужны права пользователя
+// systemd (`systemctl --user`, `systemd-run --user`) и запись в .env. Роуты Eve наружу не публикуются.
+// Одновременно работает один транспорт (блокировка + проверка подписки MAX).
 import { execFile } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { mkdir, readFile, rename, rm, writeFile, readdir, stat } from "node:fs/promises";
@@ -14,13 +21,22 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createMaxClient, resolveMaxBaseUrl } from "../agent/lib/max-api.ts";
 import { MAX_SECRET_HEADER, loadMaxConfig } from "../agent/lib/max-updates.ts";
+import { createLedger } from "../agent/lib/max-ledger.ts";
 import { readEnvFresh } from "./lib/env-file.mjs";
 import { botCommands, getLang, tr } from "./lib/i18n.mjs";
 import { createFlows } from "./lib/tg-flow.mjs";
 import { createMenu } from "./lib/menu/index.mjs";
 import { createModelWizard } from "./lib/model-wizard.mjs";
 import { createMaxTg } from "./lib/max-tg.mjs";
-import { createMaxBridge } from "./lib/max-bridge-core.mjs";
+import { createFailureTracker, createMaxBridge } from "./lib/max-bridge-core.mjs";
+import {
+  EX_CONFIG,
+  TransportConflict,
+  acquireTransportLock,
+  checkSubscriptionForMode,
+  createWebhookServer,
+  runPolling,
+} from "./lib/max-ingest.mjs";
 import { modelSummary } from "./lib/model-summary.mjs";
 import { acquireUpdateLock, releaseUpdateLock } from "./lib/update-safety.mjs";
 import { inspectUpstream, markVersionNotified, updateOffer } from "./lib/update-check.mjs";
@@ -69,7 +85,10 @@ export async function main(env = process.env) {
   const client = createMaxClient({ token: config.token, baseUrl: resolveMaxBaseUrl(env.MAX_API_BASE_URL) });
 
   const dialogs = new Map(); // user_id → последний известный chat_id диалога
-  const tg = createMaxTg(client, { dialogChatId: (u) => dialogs.get(u) ?? null, log });
+  const tracker = createFailureTracker();
+  const tg = tracker.wrap(createMaxTg(client, { dialogChatId: (u) => dialogs.get(u) ?? null, log }));
+  const ingest = String(env.MAX_INGEST ?? "poll").trim().toLowerCase() === "webhook" ? "webhook" : "poll";
+  const stateDir = join(dataDir, "max");
 
   async function reply(chatId, text) {
     const r = await tg("sendMessage", { chat_id: chatId, text });
@@ -102,8 +121,10 @@ export async function main(env = process.env) {
     }
     await res.body?.cancel().catch(() => {});
     if (res.ok) return;
-    const fatal = res.status === 401 || res.status === 404;
-    throw Object.assign(new Error(`agent channel answered HTTP ${res.status}${fatal ? " — check MAX_WEBHOOK_SECRET / MAX_BOT_TOKEN in .env" : ""}`), { retryable: true });
+    // 4xx (кроме ошибок конфигурации/перегрузки) — событие заведомо негодное: повтор не поможет, не блокируем очередь.
+    const consumed = res.status >= 400 && res.status < 500 && ![401, 404, 408, 429].includes(res.status);
+    const hint = res.status === 401 || res.status === 404 ? " — check MAX_WEBHOOK_SECRET / MAX_BOT_TOKEN in .env" : "";
+    throw Object.assign(new Error(`agent channel answered HTTP ${res.status}${hint}`), { consumed });
   }
   // Синтетическое сообщение от имени владельца (дистилляция памяти из /menu): тот же канал.
   const deliverSynthetic = async (u) => {
@@ -224,31 +245,46 @@ export async function main(env = process.env) {
 
   // ── движки меню и мастеров ─────────────────────────────────────────────
   const flows = createFlows({ tg, log });
-  const wizard = createModelWizard({ tg, log, flows, envPath, dataDir, allowed, sc, reply, isPrivate: () => true });
+  // Секреты (ключи API, client_secret, одноразовые коды) в чат MAX НЕ принимаются, пока не доказано,
+// что MAX позволяет гарантированно удалить сообщение пользователя. Явный opt-in: MAX_SECRETS_IN_CHAT=1.
+  const secretsInChat = String(env.MAX_SECRETS_IN_CHAT ?? "") === "1";
+  if (secretsInChat) log("WARNING: MAX_SECRETS_IN_CHAT=1 — secrets typed into chat may stay in the dialog history");
+  const wizard = createModelWizard({ tg, log, flows, envPath, dataDir, allowed, sc, reply, isPrivate: () => true, secretsInChat });
   const menu = createMenu({
     flows, tg,
     deps: {
-      transport: "max", envPath, dataDir, root: ROOT, sc, reply, deliver: deliverSynthetic, log, allowed,
+      transport: "max", secretsInChat, envPath, dataDir, root: ROOT, sc, reply, deliver: deliverSynthetic, log, allowed,
       handleModelCmd: wizard.handleModelCmd, handleThinkCmd: wizard.handleThinkCmd, handleUpdateCheck,
     },
   });
+  const ledger = createLedger({ dir: stateDir, log });
   const bridge = createMaxBridge({
     allowed, forward, tg, reply, menu, wizard, flows, handleUpdate: handleUpdateCallback, handleUpdateCheck,
-    restartAgent, rememberDialog: (u, c) => dialogs.set(String(u), String(c)), log,
+    restartAgent, ledger, tracker, rememberDialog: (u, c) => dialogs.set(String(u), String(c)), log,
   });
 
-  // ── старт: проверка токена, подписки, список команд ────────────────────
+  // ── один транспорт: блокировка и проверка подписки MAX ──────────────────
+  let release;
+  try {
+    release = acquireTransportLock(stateDir, ingest);
+    const sub = await checkSubscriptionForMode(client, ingest, { webhookUrl: String(env.MAX_WEBHOOK_URL ?? "").trim() });
+    if (sub.warning) log("WARNING:", sub.warning);
+  } catch (e) {
+    if (e instanceof TransportConflict) {
+      log(`FATAL: ${e.message}`);
+      release?.();
+      process.exit(EX_CONFIG);
+    }
+    throw e;
+  }
+  process.on("exit", () => release?.());
+
+  // ── старт: проверка токена, список команд ────────────────────────────────
   try {
     const me = await client.getMe();
-    log(`bot ${me.username ? "@" + me.username : "(no username)"} id=${me.userId}; allowed users: ${[...allowed].join(",") || "NONE (bot answers nobody)"}`);
+    log(`bot ${me.username ? "@" + me.username : "(no username)"} id=${me.userId}; mode=${ingest}; allowed users: ${[...allowed].join(",") || "NONE (bot answers nobody)"}`);
   } catch (e) {
     log("getMe failed — check MAX_BOT_TOKEN:", e.message);
-  }
-  try {
-    const subs = await client.getSubscriptions();
-    if (subs.length) log(`WARNING: a webhook subscription exists (${subs.join(", ")}) — MAX does not deliver updates to polling while it is active. Remove it or stop this bridge.`);
-  } catch (e) {
-    log("subscription check failed:", e.message);
   }
   try {
     await client.setCommands(botCommands(getLang()).map((c) => ({ name: c.command, description: c.description.slice(0, 128) })));
@@ -256,41 +292,35 @@ export async function main(env = process.env) {
     log("setCommands failed:", e.message);
   }
 
-  // ── цикл long polling ───────────────────────────────────────────────────
-  let marker = await loadMarker(markerFile);
-  log("polling started, marker:", marker ?? "(none)");
   const stop = new AbortController();
-  for (const sig of ["SIGTERM", "SIGINT"]) process.on(sig, () => { stop.abort(); setTimeout(() => process.exit(0), 500).unref(); });
-  let failures = 0;
-  while (!stop.signal.aborted) {
-    let page;
-    try {
-      page = await client.getUpdates({ marker, timeoutSec: 30, limit: 100, types: UPDATE_TYPES, signal: stop.signal });
-      failures = 0;
-    } catch (e) {
-      if (stop.signal.aborted) break;
-      failures += 1;
-      log(`getUpdates failed (${e.message}); retry in ${Math.min(30, 2 ** Math.min(failures, 5))}s`);
-      await sleep(Math.min(30, 2 ** Math.min(failures, 5)) * 1000);
-      continue;
-    }
-    for (const update of page.updates) {
-      // Ordered & lossless: пока канал не принял событие, дальше не идём (маркер не двигаем).
-      for (let attempt = 1; !stop.signal.aborted; attempt++) {
-        try {
-          await bridge.handleUpdate(update);
-          break;
-        } catch (e) {
-          log(`delivery to agent failed (attempt ${attempt}): ${e.message}`);
-          await sleep(Math.min(30_000, 1000 * 2 ** Math.min(attempt, 5)));
-        }
-      }
-    }
-    if (page.marker && page.marker !== marker) {
-      marker = page.marker;
-      await saveMarker(markerFile, marker).catch((e) => log("cannot save marker:", e.message));
-    }
+  let server = null;
+  const shutdown = () => {
+    stop.abort();
+    server?.close();
+    release?.();
+    setTimeout(() => process.exit(0), 500).unref();
+  };
+  for (const sig of ["SIGTERM", "SIGINT"]) process.on(sig, shutdown);
+
+  if (ingest === "webhook") {
+    const host = String(env.MAX_BRIDGE_HOST ?? "127.0.0.1").trim() || "127.0.0.1";
+    const port = Number(env.MAX_BRIDGE_PORT ?? 8725);
+    server = createWebhookServer({ secret: config.webhookSecret, process: bridge.process, log: (...a) => log(...a) });
+    await new Promise((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(port, host, resolve);
+    });
+    if (!["127.0.0.1", "::1", "localhost"].includes(host)) log(`WARNING: webhook listener is bound to ${host}; put it behind TLS and expose only /max/webhook`);
+    log(`webhook listener on http://${host}:${port}/max/webhook`);
+    await new Promise((resolve) => stop.signal.addEventListener("abort", resolve));
+    return;
   }
+
+  await runPolling({
+    client, process: bridge.process, signal: stop.signal, log,
+    types: UPDATE_TYPES,
+    markerStore: { load: () => loadMarker(markerFile), save: (m) => saveMarker(markerFile, m) },
+  });
 }
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {

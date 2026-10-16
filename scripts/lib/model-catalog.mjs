@@ -25,6 +25,19 @@ export class ModelCatalogError extends Error {
   }
 }
 
+// Тестовый/зеркальный адрес каталога: IVA_CATALOG_BASE_URL_<PROVIDER> (https; http — только loopback).
+// Ключ провайдера уходит на этот адрес, поэтому «чужие» схемы и хосты отвергаются.
+export function catalogBase(provider, cat = CATALOG[provider], env = process.env) {
+  const raw = String(env?.[`IVA_CATALOG_BASE_URL_${String(provider).toUpperCase()}`] ?? "").trim();
+  if (!raw) return cat?.base;
+  const u = new URL(raw);
+  const loopback = ["127.0.0.1", "localhost", "[::1]"].includes(u.hostname);
+  if (u.protocol !== "https:" && !(u.protocol === "http:" && loopback)) {
+    throw new Error(`IVA_CATALOG_BASE_URL_${String(provider).toUpperCase()} must be https (http only for loopback)`);
+  }
+  return u.toString().replace(/\/+$/, "");
+}
+
 export const CATALOG = {
   ollama: {
     label: "Ollama Cloud",
@@ -143,7 +156,7 @@ export async function fetchModelOptions(provider, key, {
       return validOptions(provider, live);
     }
     if (cat.base && provider !== "openrouter") {
-      const res = await fetchFn(`${cat.base}/models`, {
+      const res = await fetchFn(`${catalogBase(provider, cat)}/models`, {
         headers: { Authorization: `Bearer ${key}` },
         signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
       });

@@ -41,7 +41,8 @@ export function channelServices(env = {}) {
   return [
     "iva.service",
     ...(c.telegram ? [BRIDGE_UNIT.telegram] : []),
-    ...(c.max && c.maxIngest === "poll" ? [BRIDGE_UNIT.max] : []),
+    // Мост MAX — единая точка входа и управления в обоих режимах (polling и webhook).
+    ...(c.max ? [BRIDGE_UNIT.max] : []),
   ];
 }
 

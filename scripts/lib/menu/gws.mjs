@@ -148,6 +148,17 @@ export default {
           [ctx.backRow(PARENT)],
         );
       }
+      if (!ctx.secretsInChat()) {
+        st.awaitText = null;
+        return ctx.flows.screen(
+          st,
+          ctx.tr(
+            `The client secret is NOT sent through chat. Copy client_secret.json to the server as\n  ${SECRET_PATH}\n(chmod 600), then run on the server:  gws auth login`,
+            `client_secret в чат не отправляется. Положи client_secret.json на сервер как\n  ${SECRET_PATH}\n(chmod 600) и выполни на сервере:  gws auth login`,
+          ),
+          [ctx.backRow(PARENT)],
+        );
+      }
       st.awaitText = { kind: "gwsjson", secret: true, data: {}, file: true };
       return ctx.flows.screen(
         st,
@@ -161,6 +172,17 @@ export default {
 
     if (step === "connect") {
       const T = ctx.tr;
+      if (!ctx.secretsInChat()) {
+        st.awaitText = null;
+        return ctx.flows.screen(
+          st,
+          T(
+            "The one-time login code is NOT pasted into chat. On the server run:  gws auth login",
+            "Одноразовый код входа в чат не вставляется. На сервере выполни:  gws auth login",
+          ),
+          [ctx.backRow(PARENT)],
+        );
+      }
       reapAuth(st); // повторное «Подключить» не должно оставлять прежний detached-процесс
       const challenge = await startAuth();
       if (!challenge) {
