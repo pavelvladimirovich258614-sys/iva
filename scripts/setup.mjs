@@ -635,68 +635,68 @@ async function main() {
     });
   }
   if (useTelegram) {
-  head(useMax ? "3b" : 3, t("Telegram bot — how you talk to Iva", "Telegram-бот — через него вы говорите с Iva"));
-  console.log(`  ${t("Create a bot via @BotFather in Telegram:", "Создайте бота у @BotFather в Telegram:")}`);
-  console.log(`    1) ${t("open a chat with @BotFather", "откройте чат с @BotFather")}`);
-  console.log(`    2) ${t("send /newbot", "отправьте /newbot")}`);
-  console.log(`    3) ${t("set the bot's name and username", "задайте имя и username бота")}`);
-  console.log(`    4) ${t("copy the token like 123456789:ABCdef...", "скопируйте token вида 123456789:ABCdef...")}`);
-  let me = null;
-  out.TELEGRAM_BOT_TOKEN = await askRequired(`  ${t("Paste the Bot token", "Вставьте Bot token")}`, {
-    existing: existing.TELEGRAM_BOT_TOKEN || "",
-    validate: async (token) => {
-      try {
-        me = await telegramGetMe(token);
-        return null;
-      } catch (e) {
-        return t(`Telegram rejected the token (${e.message}). Copy it again from @BotFather.`, `Telegram не принял токен (${e.message}). Скопируйте заново у @BotFather.`);
-      }
-    },
-  });
-  out.TELEGRAM_BOT_USERNAME =
-    me?.username || out.TELEGRAM_BOT_USERNAME || (await ask(`  ${t("Bot username (without @)", "Username бота (без @)")}`, existing.TELEGRAM_BOT_USERNAME || ""));
-  if (me?.username) console.log(`  → ${t("bot", "бот")}: ${C.g}@${me.username}${C.x}`);
-  out.TELEGRAM_WEBHOOK_SECRET_TOKEN = existing.TELEGRAM_WEBHOOK_SECRET_TOKEN || randomBytes(24).toString("hex");
+    head(useMax ? "3b" : 3, t("Telegram bot — how you talk to Iva", "Telegram-бот — через него вы говорите с Iva"));
+    console.log(`  ${t("Create a bot via @BotFather in Telegram:", "Создайте бота у @BotFather в Telegram:")}`);
+    console.log(`    1) ${t("open a chat with @BotFather", "откройте чат с @BotFather")}`);
+    console.log(`    2) ${t("send /newbot", "отправьте /newbot")}`);
+    console.log(`    3) ${t("set the bot's name and username", "задайте имя и username бота")}`);
+    console.log(`    4) ${t("copy the token like 123456789:ABCdef...", "скопируйте token вида 123456789:ABCdef...")}`);
+    let me = null;
+    out.TELEGRAM_BOT_TOKEN = await askRequired(`  ${t("Paste the Bot token", "Вставьте Bot token")}`, {
+      existing: existing.TELEGRAM_BOT_TOKEN || "",
+      validate: async (token) => {
+        try {
+          me = await telegramGetMe(token);
+          return null;
+        } catch (e) {
+          return t(`Telegram rejected the token (${e.message}). Copy it again from @BotFather.`, `Telegram не принял токен (${e.message}). Скопируйте заново у @BotFather.`);
+        }
+      },
+    });
+    out.TELEGRAM_BOT_USERNAME =
+      me?.username || out.TELEGRAM_BOT_USERNAME || (await ask(`  ${t("Bot username (without @)", "Username бота (без @)")}`, existing.TELEGRAM_BOT_USERNAME || ""));
+    if (me?.username) console.log(`  → ${t("bot", "бот")}: ${C.g}@${me.username}${C.x}`);
+    out.TELEGRAM_WEBHOOK_SECRET_TOKEN = existing.TELEGRAM_WEBHOOK_SECRET_TOKEN || randomBytes(24).toString("hex");
 
-  // ── Step 4: trusted users (loop until ≥1 ID) ──────────────────────
-  head(useMax ? "4b" : 4, t("Access — who the bot answers at all", "Доступ — кому бот вообще отвечает"));
-  console.log(`  ${C.y}${t("IMPORTANT:", "ВАЖНО:")}${C.x} ${t("Iva answers ONLY trusted Telegram IDs.", "Iva отвечает ТОЛЬКО доверенным Telegram ID.")}`);
-  console.log(`  ${t("Without at least one ID the bot stays silent to everyone (that's how your data is protected).", "Без хотя бы одного ID бот промолчит всем (так ваши данные защищены).")}`);
-  const ids = new Set(
-    (existing.TELEGRAM_ALLOWED_USER_IDS || "").split(/[,\s]+/).map((s) => s.trim()).filter(Boolean),
-  );
-  while (ids.size === 0) {
-    console.log(
-      `\n  ${t("Let's find your ID.", "Определим ваш ID.")} ${C.c}${t(`Open Telegram, find @${out.TELEGRAM_BOT_USERNAME || "your_bot"} and send it any message`, `Откройте Telegram, найдите @${out.TELEGRAM_BOT_USERNAME || "своего_бота"} и напишите ему любое сообщение`)}${C.x} ${t('(e.g. "hi").', "(напр. «привет»).")}`,
+    // ── Step 4: trusted users (loop until ≥1 ID) ──────────────────────
+    head(useMax ? "4b" : 4, t("Access — who the bot answers at all", "Доступ — кому бот вообще отвечает"));
+    console.log(`  ${C.y}${t("IMPORTANT:", "ВАЖНО:")}${C.x} ${t("Iva answers ONLY trusted Telegram IDs.", "Iva отвечает ТОЛЬКО доверенным Telegram ID.")}`);
+    console.log(`  ${t("Without at least one ID the bot stays silent to everyone (that's how your data is protected).", "Без хотя бы одного ID бот промолчит всем (так ваши данные защищены).")}`);
+    const ids = new Set(
+      (existing.TELEGRAM_ALLOWED_USER_IDS || "").split(/[,\s]+/).map((s) => s.trim()).filter(Boolean),
     );
-    await ask(`  ${t("Sent the bot a message? press Enter", "Написали боту? нажмите Enter")}`);
-    try {
-      const found = await fetchTelegramUserIds(out.TELEGRAM_BOT_TOKEN);
-      if (found.length) {
-        console.log(`  ${t("Found who messaged the bot:", "Нашёл, кто писал боту:")}`);
-        found.forEach((u, i) => console.log(`   ${i + 1}. ${u.id}  ${u.name}`));
-        const pick = await ask(`  ${t("Which IDs to add? numbers comma-separated (Enter — add all)", "Чьи ID добавить? номера через запятую (Enter — добавить всех)")}`, "");
-        const chosen = pick
-          ? pick.split(/[,\s]+/).map((n) => found[parseInt(n, 10) - 1]).filter(Boolean)
-          : found;
-        chosen.forEach((u) => ids.add(u.id));
-      } else {
-        console.log(`${C.y}  ${t("I see no messages to the bot. Did you definitely send one? (if a webhook is set, getUpdates returns nothing)", "Не вижу сообщений боту. Точно написали? (если уже стоит вебхук — getUpdates не отдаёт апдейты)")}${C.x}`);
-      }
-    } catch (e) {
-      console.log(`${C.y}  ${t(`Couldn't fetch updates: ${e.message}`, `Не смог получить апдейты: ${e.message}`)}${C.x}`);
-    }
-    if (ids.size === 0) {
-      const manual = await ask(
-        `  ${t("Enter your Telegram ID manually (find it: message @userinfobot), or Enter — try again", "Введите свой Telegram ID вручную (узнать: напишите @userinfobot), или Enter — попробовать снова")}`,
-        "",
+    while (ids.size === 0) {
+      console.log(
+        `\n  ${t("Let's find your ID.", "Определим ваш ID.")} ${C.c}${t(`Open Telegram, find @${out.TELEGRAM_BOT_USERNAME || "your_bot"} and send it any message`, `Откройте Telegram, найдите @${out.TELEGRAM_BOT_USERNAME || "своего_бота"} и напишите ему любое сообщение`)}${C.x} ${t('(e.g. "hi").', "(напр. «привет»).")}`,
       );
-      manual.split(/[,\s]+/).map((s) => s.trim()).filter(Boolean).forEach((s) => ids.add(s));
+      await ask(`  ${t("Sent the bot a message? press Enter", "Написали боту? нажмите Enter")}`);
+      try {
+        const found = await fetchTelegramUserIds(out.TELEGRAM_BOT_TOKEN);
+        if (found.length) {
+          console.log(`  ${t("Found who messaged the bot:", "Нашёл, кто писал боту:")}`);
+          found.forEach((u, i) => console.log(`   ${i + 1}. ${u.id}  ${u.name}`));
+          const pick = await ask(`  ${t("Which IDs to add? numbers comma-separated (Enter — add all)", "Чьи ID добавить? номера через запятую (Enter — добавить всех)")}`, "");
+          const chosen = pick
+            ? pick.split(/[,\s]+/).map((n) => found[parseInt(n, 10) - 1]).filter(Boolean)
+            : found;
+          chosen.forEach((u) => ids.add(u.id));
+        } else {
+          console.log(`${C.y}  ${t("I see no messages to the bot. Did you definitely send one? (if a webhook is set, getUpdates returns nothing)", "Не вижу сообщений боту. Точно написали? (если уже стоит вебхук — getUpdates не отдаёт апдейты)")}${C.x}`);
+        }
+      } catch (e) {
+        console.log(`${C.y}  ${t(`Couldn't fetch updates: ${e.message}`, `Не смог получить апдейты: ${e.message}`)}${C.x}`);
+      }
+      if (ids.size === 0) {
+        const manual = await ask(
+          `  ${t("Enter your Telegram ID manually (find it: message @userinfobot), or Enter — try again", "Введите свой Telegram ID вручную (узнать: напишите @userinfobot), или Enter — попробовать снова")}`,
+          "",
+        );
+        manual.split(/[,\s]+/).map((s) => s.trim()).filter(Boolean).forEach((s) => ids.add(s));
+      }
     }
-  }
-  out.TELEGRAM_ALLOWED_USER_IDS = [...ids].join(",");
-  out.TELEGRAM_DIGEST_CHAT_ID = existing.TELEGRAM_DIGEST_CHAT_ID || [...ids][0] || "";
-  console.log(`  → ${t("access granted to ID", "доступ разрешён ID")}: ${C.g}${out.TELEGRAM_ALLOWED_USER_IDS}${C.x}`);
+    out.TELEGRAM_ALLOWED_USER_IDS = [...ids].join(",");
+    out.TELEGRAM_DIGEST_CHAT_ID = existing.TELEGRAM_DIGEST_CHAT_ID || [...ids][0] || "";
+    console.log(`  → ${t("access granted to ID", "доступ разрешён ID")}: ${C.g}${out.TELEGRAM_ALLOWED_USER_IDS}${C.x}`);
   }
 
   // ── Step 5: timezone, vault, port ─────────────────────────────────
