@@ -49,6 +49,16 @@ The allowlist is **fail-closed: empty means Iva answers nobody.** The wizard aut
 
 At 10:00 in `ASSISTANT_TIMEZONE` Iva checks Git upstream without using the model. It sends nothing unless a higher stable `MAJOR.MINOR.PATCH` version exists, and offers each version only once. If `TELEGRAM_DIGEST_CHAT_ID` is empty, the first trusted ID is used.
 
+## MAX (optional)
+
+| Variable | Default | Notes |
+|---|---|---|
+| `MAX_BOT_TOKEN` | — | Bot token from MAX. Sent only in the `Authorization` header. |
+| `MAX_WEBHOOK_SECRET` | — | Checked against `X-Max-Bot-Api-Secret` before any processing. |
+| `MAX_ALLOWED_USER_IDS` | *(empty)* | Comma-separated MAX user IDs. Fail-closed: empty means nobody. |
+
+MAX is off until both the token and the secret are set. See [max.md](./max.md).
+
 ## Voice
 
 | Variable | Default | Notes |
