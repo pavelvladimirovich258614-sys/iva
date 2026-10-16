@@ -133,6 +133,7 @@ async function main() {
   const openai = await startMockOpenAiServer();
   const maxApi = await startMockMax();
   let eve = null;
+  let bridge = null;
   try {
     const app = join(sandbox, "app");
     await mkdir(join(app, "data"), { recursive: true });
@@ -257,7 +258,7 @@ async function main() {
       message: { sender: { user_id: "999", first_name: "Iva", is_bot: true }, recipient: { chat_type: "dialog", chat_id: CHAT, user_id: null }, timestamp: Date.now(), body: { mid, seq: 1, text: "m" } },
     });
     const sentCount = () => maxApi.received.length;
-    let bridge = startBridge({ app, env });
+    bridge = startBridge({ app, env });
     await until(() => maxApi.commands.length > 0, "bridge registered bot commands");
     assert(maxApi.commands.some((c) => c.name === "menu") && maxApi.commands.some((c) => c.name === "model"), "commands registered");
 
@@ -270,12 +271,18 @@ async function main() {
     assert(openai.requests.length === modelReqs + 1, "exactly one model turn");
 
     setPhase("bridge-stranger");
+    // на медленном раннере после ответа могут дойти хвостовые запросы к модели: ждём, пока счётчики устоятся
+    for (let last = "", stable = 0; stable < 3; await sleep(700)) {
+      const cur = `${sentCount()}/${openai.requests.length}`;
+      stable = cur === last ? stable + 1 : 0;
+      last = cur;
+    }
     n3 = sentCount();
     const reqs2 = openai.requests.length;
     maxApi.push(msg({ text: "/menu", mid: "br2", userId: "222" }));
     maxApi.push(msg({ text: "hello agent", mid: "br3", userId: "222" }));
     await sleep(2500);
-    assert(sentCount() === n3 && openai.requests.length === reqs2, "strangers get nothing through the bridge");
+    assert(sentCount() === n3 && openai.requests.length === reqs2, `strangers get nothing through the bridge (sent ${n3}->${sentCount()}, model requests ${reqs2}->${openai.requests.length}, last: ${JSON.stringify(maxApi.received.at(-1)?.text)})`);
 
     setPhase("bridge-help-usage");
     n3 = sentCount();
@@ -353,7 +360,7 @@ async function main() {
     for (const l of logs.slice(-100)) console.error(l);
     process.exitCode = 1;
   } finally {
-    await stopEve(eve); await openai.close(); await maxApi.close();
+    await stopEve(bridge); await stopEve(eve); await openai.close(); await maxApi.close();
     if (process.env.REPLICA_KEEP === "1") console.error(`sandbox kept: ${sandbox}`);
     else await rm(sandbox, { recursive: true, force: true });
   }

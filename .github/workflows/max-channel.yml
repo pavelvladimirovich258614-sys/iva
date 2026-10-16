@@ -58,9 +58,11 @@ jobs:
         run: npm run replica
 
       - name: MAX e2e - channel and polling bridge (built Eve, mock model, mock MAX API)
+        timeout-minutes: 10
         run: npm run test:max-e2e
 
       - name: MAX e2e - webhook production topology (built Eve, mock model, mock MAX API)
+        timeout-minutes: 10
         run: npm run test:max-webhook-e2e
 
       - name: Secrets must not be tracked
