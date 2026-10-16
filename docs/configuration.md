@@ -35,7 +35,7 @@ For `codex` there is no API key in `.env`: run `iva login` (device code, headles
 
 **Don't inflate the context window.** Compaction triggers at 70% of this number. Set it above the model's real window and the compactor fires too late — the request overflows before history gets trimmed. When you switch models, enter the new model's actual window, not a rounder bigger one.
 
-## Telegram
+## Telegram (optional)
 
 | Variable | Default | Notes |
 |---|---|---|
@@ -49,15 +49,20 @@ The allowlist is **fail-closed: empty means Iva answers nobody.** The wizard aut
 
 At 10:00 in `ASSISTANT_TIMEZONE` Iva checks Git upstream without using the model. It sends nothing unless a higher stable `MAJOR.MINOR.PATCH` version exists, and offers each version only once. If `TELEGRAM_DIGEST_CHAT_ID` is empty, the first trusted ID is used.
 
-## MAX (optional)
+## Channels and MAX
 
 | Variable | Default | Notes |
 |---|---|---|
-| `MAX_BOT_TOKEN` | — | Bot token from MAX. Sent only in the `Authorization` header. |
-| `MAX_WEBHOOK_SECRET` | — | Checked against `X-Max-Bot-Api-Secret` before any processing. |
+| `IVA_CHANNELS` | *(inferred from tokens)* | `max`, `telegram` or `max,telegram`. Written by `npm run setup`. MAX-only installs never start Telegram services. |
+| `MAX_BOT_TOKEN` | — | Bot token from the MAX platform. Sent only in the `Authorization` header. |
+| `MAX_WEBHOOK_SECRET` | — | Random `[A-Za-z0-9_-]{5,256}`; checked against `X-Max-Bot-Api-Secret` and used by the bridge. |
 | `MAX_ALLOWED_USER_IDS` | *(empty)* | Comma-separated MAX user IDs. Fail-closed: empty means nobody. |
+| `MAX_INGEST` | `poll` | `poll` (bridge, no public HTTPS) or `webhook`. |
+| `MAX_NOTIFY_USER_ID` | first allowed id | Recipient of digests, reports and update offers. |
+| `NOTIFY_CHANNEL` | `auto` | `auto` (MAX, else Telegram) / `max` / `telegram` / `none`. |
 
-MAX is off until both the token and the secret are set. See [max.md](./max.md).
+MAX is off until the token and the secret are set. All `TELEGRAM_*` variables below are optional and
+may stay empty. See [max.md](./max.md).
 
 ## Voice
 

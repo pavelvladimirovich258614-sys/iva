@@ -12,6 +12,7 @@ import { fileURLToPath } from "node:url";
 import { homedir, tmpdir } from "node:os";
 import { createInterface } from "node:readline/promises";
 import { modelSummary } from "../scripts/lib/model-summary.mjs";
+import { BRIDGE_UNIT, channelLabel, channelServices, configuredChannels, unusedBridgeUnits } from "../scripts/lib/channels.mjs";
 import { createTerminalProgress } from "../scripts/lib/progress.mjs";
 import { quarantinePath, resetStateTargets } from "../scripts/lib/wf-store.mjs";
 import { createTelegramUpdateReporter, loadTelegramJob, removeTelegramJob } from "../scripts/lib/telegram-status.mjs";
@@ -44,7 +45,11 @@ const NPM = existsSync(join(NODE_BIN_DIR, "npm")) ? join(NODE_BIN_DIR, "npm") : 
 // Children inherit PATH with the node directory — otherwise npm/eve won't be found when called via wrapper.
 const childEnv = { ...process.env, PATH: `${NODE_BIN_DIR}:${process.env.PATH || ""}` };
 
-const SERVICES = ["iva.service", "iva-telegram-poll.service"];
+// Agent + the bridge(s) of the enabled channels (MAX-only installs never start telegram-poll).
+// See scripts/lib/channels.mjs; IVA_CHANNELS in .env selects them explicitly.
+const SERVICES = channelServices(readEnv());
+const unitName = (u) => u.replace(/\.service$/, "");
+const servicesLabel = (list = SERVICES) => list.map(unitName).join(" + ");
 const MEMORY_PERIODS = ["daily", "weekly", "monthly", "yearly", "doctor"];
 const MEMORY_SERVICES = MEMORY_PERIODS.map((n) => `iva-memory-${n}.service`);
 const MEMORY_TIMERS = MEMORY_PERIODS.map((n) => `iva-memory-${n}.timer`);
@@ -237,6 +242,16 @@ function writeUnits({ ensureBearer = true } = {}) {
 
 function activateUnits() {
   systemd.activate([...SERVICES, ...TIMERS]);
+  // A bridge of a channel that is not enabled must not keep running (e.g. telegram-poll left over
+  // from before the switch to MAX-only): stop and disable it. Best-effort, never fatal.
+  for (const unit of unusedBridgeUnits(readEnv())) {
+    if (!existsSync(join(UNIT_DIR, unit))) continue;
+    try {
+      if (systemd.isEnabled(unit) || systemd.isActive(unit)) systemd.disableNow([unit]);
+    } catch (e) {
+      warn(`could not disable ${unit}: ${e.message}`);
+    }
+  }
 }
 
 function removeUnits() {
@@ -663,13 +678,13 @@ async function cmdConfig(args = []) {
         key: selected[1] ? nextEnv[selected[1]] : undefined,
         dataDir: dataDirAbs(nextEnv),
       },
-      services: SERVICES,
+      services: channelServices(nextEnv),
       healthUrl: `http://127.0.0.1:${port}/eve/v1/health`,
     }, {
       restart: restartConfiguredServices,
       health: (url) => probeEveHealth(url),
     });
-    ok("Configuration applied; agent and Telegram bridge are active");
+    ok(`Configuration applied; services active: ${servicesLabel(channelServices(nextEnv))}`);
   } finally {
     rmSync(candidateDir, { recursive: true, force: true });
   }
@@ -700,11 +715,12 @@ async function cmdDoctor() {
       openrouter: ["OPENROUTER_API_KEY", "OPENROUTER_MODEL"],
       codex: ["CODEX_MODEL"],
     };
+    const ch = configuredChannels(env);
     const REQUIRED = [
       ...(PROV_KEYS[prov] || PROV_KEYS.ollama),
-      "DEEPGRAM_API_KEY",
-      "TELEGRAM_BOT_TOKEN",
-      "TELEGRAM_ALLOWED_USER_IDS",
+      // Deepgram transcribes Telegram voice/video; the MAX channel is text-only for now.
+      ...(ch.telegram ? ["DEEPGRAM_API_KEY", "TELEGRAM_BOT_TOKEN", "TELEGRAM_ALLOWED_USER_IDS"] : []),
+      ...(ch.max ? ["MAX_BOT_TOKEN", "MAX_WEBHOOK_SECRET", "MAX_ALLOWED_USER_IDS"] : []),
       "ASSISTANT_BEARER",
     ];
     const missing = REQUIRED.filter((k) => !(env[k] || "").trim());
@@ -899,9 +915,9 @@ function cmdStatus() {
 function cmdRestart() {
   requireSystemd();
   restartServices(); // regenerate the unit before restart → PORT stays in sync with IVA_PORT in .env
-  ok("Restarted: iva + telegram-poll");
+  ok(`Restarted: ${servicesLabel()}`);
 }
-// Full reset: stop services, quarantine workflow + Telegram control state, bring it back up.
+// Full reset: stop services, quarantine workflow + channel control state, bring it back up.
 // A plain restart
 // does NOT cure a stuck/bloated run — on startup eve re-enqueues all pending/running
 // runs ("Re-enqueued N active run(s) on startup"). We clean while the server is stopped
@@ -917,7 +933,7 @@ function cmdReset() {
   try {
     systemd.stop(SERVICES);
   } catch (e) {
-    bad(`${e.message} Workflow and Telegram control state left untouched`);
+    bad(`${e.message} Workflow and channel control state left untouched`);
     process.exit(1);
   }
   let found = false;
@@ -935,7 +951,7 @@ function cmdReset() {
       warn(`failed to quarantine ${relative(ROOT, target)}: ${e.message}`);
     }
   }
-  if (!found && !failed) ok("workflow and Telegram control state already empty");
+  if (!found && !failed) ok("workflow and channel control state already empty");
   let restartError = null;
   try {
     restartServices();
@@ -945,9 +961,9 @@ function cmdReset() {
   if (restartError) {
     bad(restartError.message);
   }
-  if (failed) bad("Reset INCOMPLETE — old workflow or Telegram control state may still be active");
+  if (failed) bad("Reset INCOMPLETE — old workflow or channel control state may still be active");
   if (failed || restartError) process.exit(1);
-  ok("Restarted: iva + telegram-poll");
+  ok(`Restarted: ${servicesLabel()}`);
 }
 function cmdStart() {
   requireSystemd();
@@ -961,7 +977,9 @@ function cmdStop() {
 }
 function cmdLogs(args) {
   requireSystemd();
-  const unit = args.includes("poll") ? "iva-telegram-poll.service" : "iva.service";
+  // `iva logs poll|bridge` → the bridge of the enabled channel (MAX preferred), else the agent.
+  const bridge = SERVICES.find((u) => u === BRIDGE_UNIT.max) ?? SERVICES.find((u) => u === BRIDGE_UNIT.telegram);
+  const unit = args.includes("poll") || args.includes("bridge") ? (bridge ?? "iva.service") : "iva.service";
   run("journalctl", ["--user", "-u", unit, "-f", "-n", "50"]);
 }
 
@@ -1048,16 +1066,17 @@ ${C.b}Iva CLI${C.x} — manage your personal agent
 
 ${C.b}Commands:${C.x}
   ${C.c}iva update${C.x}         update: git pull + build + restart
-  ${C.c}iva config${C.x}         configure: model, Telegram, Deepgram, TZ, vault
+  ${C.c}iva config${C.x}         configure: model, channel (MAX/Telegram), TZ, vault
   ${C.c}iva login${C.x} [--browser]  sign in to an OpenAI subscription (ChatGPT) for MODEL_PROVIDER=codex
   ${C.c}iva doctor${C.x}         diagnose and safely auto-repair the install
   ${C.c}iva status${C.x}         status of services and memory timers
-  ${C.c}iva restart${C.x}        restart the agent and Telegram bridge
+  ${C.c}iva restart${C.x}        restart the agent and the channel bridge
   ${C.c}iva reset${C.x}          full reset: clear stuck workflows and restart
   ${C.c}iva start${C.x} / ${C.c}stop${C.x}    start / stop
   ${C.c}iva usage${C.x} [win]      token usage (last|today|week|month|by-model|by-source|tail)
+  ${C.c}iva max${C.x} [check|status|whoami]  MAX channel diagnostics (token, allowlist, delivery queue)
   ${C.c}iva userbot${C.x} [creds|setup|status|diagnose --json|off]  personal-account userbot proxy
-  ${C.c}iva logs${C.x} [poll]     agent logs (or the Telegram bridge) -f
+  ${C.c}iva logs${C.x} [poll]     agent logs (or the channel bridge) -f
   ${C.c}iva uninstall${C.x}       remove units and the command (--purge — delete code+vault)
   ${C.c}iva version${C.x}         version and git commit
 
@@ -1066,6 +1085,63 @@ ${C.b}Commands:${C.x}
 }
 
 // ── router ──────────────────────────────────────────────────────────────────
+// ── MAX channel diagnostics ───────────────────────────────────────────────
+// `iva max check`   token, bot identity, allowlist, webhook subscription, bridge/agent services
+// `iva max status`  outbound delivery queue of the running agent (dead items = undelivered replies)
+// `iva max whoami`  user ids that recently messaged the bot (to fill MAX_ALLOWED_USER_IDS)
+async function cmdMax(args) {
+  const sub = args[0] || "check";
+  const env = { ...process.env, ...readEnv() };
+  const token = (env.MAX_BOT_TOKEN || "").trim();
+  if (!token) {
+    bad("MAX_BOT_TOKEN is not set — run: iva config");
+    process.exit(1);
+  }
+  const { createMaxClient, resolveMaxBaseUrl } = await import("../agent/lib/max-api.ts");
+  const client = createMaxClient({ token, baseUrl: resolveMaxBaseUrl(env.MAX_API_BASE_URL) });
+  if (sub === "status") {
+    const port = (env.IVA_PORT || DEFAULT_PORT).trim();
+    const res = await fetch(`http://127.0.0.1:${port}/eve/v1/max/status`, {
+      headers: { "x-max-bot-api-secret": env.MAX_WEBHOOK_SECRET || "" },
+      signal: AbortSignal.timeout(5000),
+    }).catch((e) => ({ ok: false, status: e.name }));
+    if (!res.ok) return bad(`agent did not answer the status request (${res.status}) — is iva.service running with MAX enabled?`);
+    const st = await res.json();
+    ok(`accepted events: ${st.acceptedEvents} · queued replies: ${st.queued} · undelivered (dead): ${st.dead}`);
+    for (const d of st.deadItems) warn(`dead ${d.id} user=${d.userId} attempts=${d.attempts} status=${d.lastError?.status ?? "network"} reason=${d.lastError?.name}`);
+    return;
+  }
+  if (sub === "whoami") {
+    const { peekMaxUsers } = await import("../scripts/lib/max-setup.mjs");
+    const users = await peekMaxUsers(client, { timeoutSec: 2 });
+    if (!users.length) return warn("no recent private messages to the bot (if the bridge is running it may have consumed them — message the bot again and rerun right away)");
+    for (const u of users) console.log(`${u.id}  ${u.name}`);
+    return;
+  }
+  // check
+  try {
+    const me = await client.getMe();
+    ok(`token valid — bot ${me.username ? "@" + me.username : "(no username)"} (id ${me.userId})`);
+  } catch (e) {
+    bad(`token check failed: ${e.message}`);
+    process.exit(1);
+  }
+  const allowed = (env.MAX_ALLOWED_USER_IDS || "").split(/[,\s]+/).filter((x) => /^\d+$/.test(x));
+  if (allowed.length) ok(`allowlist: ${allowed.join(", ")}`);
+  else warn("MAX_ALLOWED_USER_IDS is empty — the bot answers nobody");
+  if (!(env.MAX_WEBHOOK_SECRET || "").trim()) warn("MAX_WEBHOOK_SECRET is empty — the MAX channel is disabled");
+  try {
+    const subs = await client.getSubscriptions();
+    const poll = (env.MAX_INGEST || "poll") !== "webhook";
+    if (subs.length && poll) warn(`webhook subscription exists (${subs.join(", ")}) but MAX_INGEST=poll: MAX will not deliver updates to the bridge until it is removed`);
+    else if (!subs.length && !poll) warn("MAX_INGEST=webhook but no webhook subscription exists (POST /subscriptions, see docs/max.md)");
+    else ok(subs.length ? `webhook subscription: ${subs.join(", ")}` : "no webhook subscription (polling mode)");
+  } catch (e) {
+    warn(`could not read subscriptions: ${e.message}`);
+  }
+  if (hasSystemd()) for (const svc of SERVICES) (systemd.isActive(svc) ? ok : warn)(`${svc} ${systemd.isActive(svc) ? "active" : "NOT active"}`);
+}
+
 // ── Telegram userbot (opt-in) ────────────────────────────────────────────
 // Build the venv if missing and ALWAYS sync deps (idempotent), then verify the
 // critical imports actually resolve. Throws on any failure so the caller aborts
@@ -1249,6 +1325,7 @@ const cmds = {
   start: cmdStart,
   stop: cmdStop,
   logs: cmdLogs,
+  max: cmdMax,
   uninstall: cmdUninstall,
   version: cmdVersion,
   tree: showTree, // play the ANSI tree (wind animation)
@@ -1257,6 +1334,21 @@ const cmds = {
   "-h": cmdHelp,
   // Internal installer seams: one writer and the same checked activator used by
   // `iva start` and doctor. Success is printed only after every unit is enabled and active.
+  // install.sh helpers: which channel(s) are enabled and where to send the "installed" confirmation.
+  "_channel-info": () => {
+    const env = readEnv();
+    console.log(`${channelLabel(env)}|${channelServices(env).filter((u) => u !== "iva.service").map(unitName).join(" ")}`);
+  },
+  "_confirm": async (args) => {
+    const { sendNotice, notifyConfigured } = await import("../scripts/lib/notify.mjs");
+    const env = { ...process.env, ...readEnv() };
+    if (!notifyConfigured(env)) return;
+    const r = await sendNotice(args.join(" ") || "Iva is online.", { env });
+    if (!r.ok) {
+      console.error(`confirmation not sent: ${r.error}`);
+      process.exitCode = 1;
+    }
+  },
   "_install-units": () => ok(`systemd units written: ${writeUnits().length}`),
   "_activate-units": () => {
     activateUnits();

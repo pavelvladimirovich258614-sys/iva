@@ -1,12 +1,58 @@
-# MAX channel (MVP, opt-in)
+# Iva over MAX (MAX-only setup)
 
-A second channel to the **same** Iva agent (same model, tools, skills, vault). Telegram is unaffected:
-without `MAX_BOT_TOKEN` + `MAX_WEBHOOK_SECRET` the route answers `404` and nothing starts.
+MAX is a first-class channel of the **same** Iva agent (same model, memory, skills, MCP tools,
+tasks). Telegram is optional and off by default: `npm run setup` offers *MAX*, *Telegram* or *both*,
+and a MAX-only install never starts `telegram-poll`, the Telegram userbot, or asks for any
+`TELEGRAM_*` value (empty ones are fine).
 
-Scope of the MVP: private text messages, `/start`, `/new`, `bot_started`. Not yet: media, voice,
-buttons, groups/channels (ignored), task/digest delivery.
+## Quick start (MAX only)
 
-## How it works
+1. Create a bot on the MAX platform (<https://business.max.ru>, docs: <https://dev.max.ru>) and copy
+   its access token.
+2. Run the installer (`install.sh`) or `npm run setup` / `iva config` and choose **1) MAX**. The
+   wizard validates the token (`GET /me`), generates the internal secret, and finds your user id:
+   press *Start* in the bot and send any message, then pick your id from the list.
+3. The installer builds Iva and starts two services: `iva` (the agent) and `iva-max-bridge`
+   (polling bridge). Open the bot in MAX and write to it. `iva max check` verifies everything.
+
+Nothing else is needed: no public domain, no HTTPS, no Telegram.
+
+### Ingest modes
+
+| `MAX_INGEST` | How events arrive | Needs | Control commands |
+|---|---|---|---|
+| `poll` (default) | the bridge long-polls `GET /updates` | nothing public | all |
+| `webhook` | MAX calls `POST /eve/v1/max` | public HTTPS on 443 + `POST /subscriptions` | `/new /stop /help /usage` only (the rest need the bridge) |
+
+MAX documents long polling as unsuitable for high-load production; for a personal single-user agent
+it is the simplest reliable setup. Webhook and polling are mutually exclusive — `iva max check`
+warns if a subscription exists while `MAX_INGEST=poll`.
+
+## Commands (all work from MAX)
+
+| Command | Served by | What it does |
+|---|---|---|
+| plain text, `/task <text>`, `/tasks`, `/digest` | agent | tasks/digest go through the normal agent tools |
+| `/new` `/stop` | channel | reset this MAX conversation / cancel the running turn |
+| `/help` `/usage [window]` | channel | command list / token spend (no model call) |
+| `/menu` | bridge | settings menu with inline buttons (model, thinking, search, language, character, memory, Google, timers, skills, status, maintenance) |
+| `/model` `/think` | bridge | provider / model / reasoning wizard (writes `.env`, restart to apply) |
+| `/restart` `/update` | bridge | restart the agent / check and install a new version with progress in the same message |
+
+Buttons use MAX inline keyboards (`callback` buttons, payload ≤ 1024); the existing menu engine
+runs unchanged through a small Bot-API adapter (`scripts/lib/max-tg.mjs`). API keys typed into the
+wizard are captured by the bridge and never reach the agent; MAX may refuse to delete the user's
+message — the wizard then asks you to delete it manually.
+
+## Notifications, digests and background jobs
+
+Daily digest, memory reports (daily/weekly), the vault doctor, the nightly update check and the
+installer confirmation all use `scripts/lib/notify.mjs`. `NOTIFY_CHANNEL=auto` sends to MAX when
+`MAX_BOT_TOKEN` and a recipient (`MAX_NOTIFY_USER_ID`, default: first `MAX_ALLOWED_USER_IDS`) exist,
+otherwise to Telegram if configured. If no channel is configured the jobs still run — memory and
+tasks never depend on delivery.
+
+## How the channel works
 
 `POST /eve/v1/max` (custom eve channel, `agent/channels/max.ts`):
 
@@ -49,37 +95,66 @@ supply one.
 
 State lives in `data/max/` (untracked, files `0600`). Run a single Iva instance per data dir.
 
-## Connect
 
-1. Create a bot on MAX (platform docs: https://dev.max.ru) and copy its token.
-2. In `.env` (untracked): `MAX_BOT_TOKEN`, `MAX_WEBHOOK_SECRET` (random, A-Z a-z 0-9 _ -),
-   `MAX_ALLOWED_USER_IDS` (your MAX user id).
-3. `npm run build` and restart Iva (changes under `agent/*` need a rebuild).
-4. Expose **only** `/eve/v1/max` over HTTPS (port 443, valid chain) through a reverse proxy; do not
-   publish the rest of the Eve HTTP API.
-5. Smoke check the token: `curl -H "Authorization: $MAX_BOT_TOKEN" https://platform-api2.max.ru/me`.
-6. Subscribe the webhook (**this makes the bot live — do it deliberately**):
+## Operations
 
-   ```sh
-   curl -X POST https://platform-api2.max.ru/subscriptions \
-     -H "Authorization: $MAX_BOT_TOKEN" -H 'Content-Type: application/json' \
-     -d "{\"url\":\"https://YOUR_HOST/eve/v1/max\",\"update_types\":[\"message_created\",\"bot_started\"],\"secret\":\"$MAX_WEBHOOK_SECRET\"}"
-   ```
+```sh
+iva max check     # token, bot identity, allowlist, webhook subscription, services
+iva max status    # outbound queue of the running agent (dead = undelivered replies)
+iva max whoami    # user ids that recently wrote to the bot
+iva logs bridge   # journal of iva-max-bridge     (iva logs → agent)
+iva restart       # agent + bridge
+```
 
-Webhook and long polling cannot be active at the same time.
+Switching channels later: edit `IVA_CHANNELS` (or rerun `iva config`) and `iva restart`; a bridge of
+a channel that is no longer enabled is stopped and disabled automatically. Existing Telegram
+installs keep working unchanged (channels are inferred from tokens when `IVA_CHANNELS` is absent).
 
-## Caveats
+## Security model
 
-- Field names follow the official schema (`max-messenger/api-schema`, `schema.yaml`, v0.0.33).
-  No live smoke test with a real bot has been done yet; `429` is handled although the schema only
-  lists `401/403/500` for `POST /messages`.
-- Replies are plain text (no MAX markdown formatting yet).
+- Fail-closed allowlist (`MAX_ALLOWED_USER_IDS`): empty means nobody; strangers get no reply and
+  never reach the agent, the menu or the wizards (checked in the bridge *and* in the channel).
+- The channel verifies `X-Max-Bot-Api-Secret` in constant time before reading the body; the bridge
+  uses the same secret on its loopback hop to `127.0.0.1`. Do not expose the Eve HTTP API: publish
+  at most `/eve/v1/max` through a reverse proxy.
+- Tokens live only in `.env` (git-ignored), are sent only in the `Authorization` header and are
+  never logged or printed. State is under `data/` (untracked, `0600`).
+- Inbound text goes through `sanitizeInbound`, outbound through `scanOutbound`.
+
+## Webhook mode (optional)
+
+```sh
+curl -X POST https://platform-api2.max.ru/subscriptions \
+  -H "Authorization: $MAX_BOT_TOKEN" -H 'Content-Type: application/json' \
+  -d "{\"url\":\"https://YOUR_HOST/eve/v1/max\",\"update_types\":[\"message_created\",\"message_callback\",\"bot_started\"],\"secret\":\"$MAX_WEBHOOK_SECRET\"}"
+```
+
+Set `MAX_INGEST=webhook`, `iva restart`. **This makes the bot live on that URL — do it
+deliberately.** Port 443 and a valid TLS chain are required by MAX.
+
+## Known limits
+
+- Text only: photos, documents, voice and group chats are not handled yet (ignored).
+- Replies are plain text (agent markdown is not converted for regular replies; reports use MAX
+  `markdown` with a plain fallback).
+- `/stop` cancels the active turn; a message sent while the agent is busy is queued by Eve and
+  answered after the current turn.
+- Field names follow the official schema (`max-messenger/api-schema`, v0.0.33). No live test with a
+  real bot was possible in CI — run the checklist below once.
+
+## Live smoke checklist (separate test bot)
+
+1. `iva max check` — token valid, allowlist as expected, no unexpected webhook.
+2. Write "hi" → answer arrives once. Send `/help`, `/usage`, `/tasks`.
+3. `/menu` → open *Status*, press *‹ Menu*, *✖ Close*; `/model` → *Cancel*.
+4. Stranger account writes → no answer, nothing in `iva logs`.
+5. `iva restart` while chatting → bridge and agent come back, no duplicate answers.
+6. `iva max status` → `dead: 0`.
 
 ## Testing
 
-- Unit: `node --test agent/lib/max-*.test.mjs`.
-- End-to-end on the built eve server with mock model and mock MAX API: `npm run test:max-e2e`
-  (needs Node 24; covers auth, allowlist, body limit, round trip, dedup, `/new`, outbox retry,
-  restart durability).
-- Optional env for tests/diagnostics: `MAX_API_BASE_URL` (https, or http on loopback only),
-  `MAX_OUTBOX_BACKOFF_MS`, `MAX_MIN_SEND_INTERVAL_MS`.
+- Unit: `node --test agent/lib/max-*.test.mjs scripts/lib/max-*.test.mjs scripts/lib/notify.test.mjs`.
+- End-to-end on the built Eve server with mock model and mock MAX API (bridge, buttons, restart,
+  agent downtime): `npm run test:max-e2e` (Node 24).
+- Test-only env: `MAX_API_BASE_URL` (https, or http on loopback), `MAX_OUTBOX_BACKOFF_MS`,
+  `MAX_MIN_SEND_INTERVAL_MS`.

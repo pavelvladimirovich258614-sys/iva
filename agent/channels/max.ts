@@ -3,6 +3,7 @@
 // Доступ: MAX_ALLOWED_USER_IDS (пусто = никому). Сессии изолированы от Telegram (namespace «max:»).
 // Состояние (дедуп входящих, очередь исходящих) — data/max/, вне git. Подробности: docs/max.md.
 import { defineChannel, GET, POST } from "eve/channels";
+import { appendDaily } from "../lib/daily-log.js";
 import { humanizeProviderError } from "../lib/error-humanizer.js";
 import { createMaxClient, resolveMaxBaseUrl } from "../lib/max-api.js";
 import { createMaxOutbox } from "../lib/max-outbox.js";
@@ -94,6 +95,7 @@ export default defineChannel<MaxChannelState, { state: MaxChannelState }>({
         reset: (options) => reset(options),
         cancel: (options) => cancel(options),
         commands: commands(),
+        logInbound: (text) => void appendDaily("[text]", text),
       });
     }),
     // Сброс сессии MAX-диалога для моста (/restart): тот же секрет, что и у webhook.

@@ -22,6 +22,8 @@ import {
   validateModelSelection,
 } from "./lib/model-validation.mjs";
 import { keptSetupWritePlan } from "./lib/setup-keep.mjs";
+import { configuredChannels } from "./lib/channels.mjs";
+import { setupMaxChannel } from "./lib/max-setup.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const SOURCE_ENV_PATH = join(ROOT, ".env");
@@ -170,6 +172,8 @@ async function writeEnv(out) {
     "OPENCODE_API_KEY", "OPENCODE_MODEL", "OPENCODE_CONTEXT_WINDOW",
     "OPENROUTER_API_KEY", "OPENROUTER_MODEL", "OPENROUTER_CONTEXT_WINDOW",
     "CODEX_MODEL", "CODEX_CONTEXT_WINDOW",
+    "IVA_CHANNELS",
+    "MAX_BOT_TOKEN", "MAX_BOT_USERNAME", "MAX_WEBHOOK_SECRET", "MAX_INGEST", "MAX_ALLOWED_USER_IDS",
     "TELEGRAM_BOT_TOKEN", "TELEGRAM_BOT_USERNAME", "TELEGRAM_WEBHOOK_SECRET_TOKEN",
     "TELEGRAM_ALLOWED_USER_IDS", "TELEGRAM_DIGEST_CHAT_ID",
     "DEEPGRAM_API_KEY", "DEEPGRAM_LANGUAGE",
@@ -379,16 +383,28 @@ async function main() {
   // codex — доступ по OAuth-токену (data/codex-auth.json), у ollama/opencode/openrouter — API-ключ в .env.
   // ollama задан явно: `null ?? default` вернул бы ключ и для codex (null нуллиш) → мастер зацикливался бы.
   const provKey = { ollama: "OLLAMA_API_KEY", opencode: "OPENCODE_API_KEY", openrouter: "OPENROUTER_API_KEY", codex: null }[prov0];
-  const REQUIRED = [provModel, "DEEPGRAM_API_KEY", "TELEGRAM_BOT_TOKEN", "TELEGRAM_ALLOWED_USER_IDS", ...(provKey ? [provKey] : [])];
+  const prevCh = configuredChannels(existing);
+  // Deepgram (voice/video transcription) is only used by the Telegram channel; MAX is text-only for now.
+  const REQUIRED = [
+    provModel,
+    ...(prevCh.telegram ? ["DEEPGRAM_API_KEY", "TELEGRAM_BOT_TOKEN", "TELEGRAM_ALLOWED_USER_IDS"] : []),
+    ...(prevCh.max ? ["MAX_BOT_TOKEN", "MAX_WEBHOOK_SECRET", "MAX_ALLOWED_USER_IDS"] : []),
+    ...(provKey ? [provKey] : []),
+  ];
   const loggedInCodex = prov0 !== "codex" || existsSync(authFilePath(dataDirAbs(existing)));
   const isComplete = loggedInCodex && REQUIRED.every((k) => (existing[k] || "").trim());
   if (isComplete) {
     console.log(`\n${C.b}${C.g}  ${t("Iva is already configured:", "Iva уже настроена:")}${C.x}`);
     console.log(`  • ${t("Provider", "Провайдер")}: ${prov0}`);
     console.log(`  • ${t("Model", "Модель")}:    ${existing[provModel]}`);
-    console.log(`  • ${t("Bot", "Бот")}:       @${existing.TELEGRAM_BOT_USERNAME || "?"}`);
-    console.log(`  • ${t("Access", "Доступ")}:    ${existing.TELEGRAM_ALLOWED_USER_IDS}`);
-    console.log(`  • Deepgram:  ${existing.DEEPGRAM_LANGUAGE || "multi"}   ·   TZ: ${existing.ASSISTANT_TIMEZONE || "?"}`);
+    if (prevCh.max) {
+      console.log(`  • MAX:       @${existing.MAX_BOT_USERNAME || "?"}   ·   ${t("Access", "Доступ")}: ${existing.MAX_ALLOWED_USER_IDS}`);
+    }
+    if (prevCh.telegram) {
+      console.log(`  • Telegram:  @${existing.TELEGRAM_BOT_USERNAME || "?"}   ·   ${t("Access", "Доступ")}: ${existing.TELEGRAM_ALLOWED_USER_IDS}`);
+      console.log(`  • Deepgram:  ${existing.DEEPGRAM_LANGUAGE || "multi"}`);
+    }
+    console.log(`  • TZ: ${existing.ASSISTANT_TIMEZONE || "?"}`);
     if (!(await askYesNo(`\n  ${t("Reconfigure from scratch?", "Перенастроить заново?")}`, false))) {
       if (keptSetupWritePlan(existing, out) === "validate-and-write") {
         await validateModelSelection({
@@ -530,17 +546,31 @@ async function main() {
     `  ${C.y}${t("Don't inflate the context window:", "Окно контекста не завышайте:")}${C.x} ${t("compaction computes its threshold from it; an inflated window risks overflow.", "компактация считает порог от него; завышенное окно = риск переполнения.")}`,
   );
 
-  // ── Step 2: Deepgram (voice/video) ────────────────────────────────
-  head(2, t("Deepgram — voice and video transcription", "Deepgram — расшифровка голоса и видео"));
-  console.log(`  ${t("Where to get the key", "Где взять ключ")}: ${C.c}https://console.deepgram.com${C.x}`);
-  console.log(`    1) ${t("sign up (free starter credit)", "зарегистрируйтесь (дают бесплатный стартовый кредит)")}`);
-  console.log("    2) API Keys → Create a New API Key");
-  console.log(`    3) ${t("copy the key", "скопируйте ключ")}`);
-  out.DEEPGRAM_API_KEY = await askRequired(`  ${t("Paste the Deepgram API key", "Вставьте Deepgram API key")}`, {
-    existing: process.env.DEEPGRAM_API_KEY || existing.DEEPGRAM_API_KEY || "",
-    validate: deepgramCheck,
-  });
-  out.DEEPGRAM_LANGUAGE = await ask(`  ${t("Recognition language (multi = auto ru/uz/en)", "Язык распознавания (multi = авто ru/uz/en)")}`, out.DEEPGRAM_LANGUAGE || "multi");
+  // ── Step 2: channel (how you talk to Iva) + optional Deepgram ─────
+  head(2, t("Channel — where you talk to Iva", "Канал — где вы говорите с Iva"));
+  console.log(`    1) MAX ${t("(recommended)", "(рекомендуется)")} — ${t("no Telegram needed", "Telegram не нужен")}`);
+  console.log("    2) Telegram");
+  console.log(`    3) ${t("both", "оба")}`);
+  const hadAny = existing.IVA_CHANNELS || existing.TELEGRAM_BOT_TOKEN || existing.MAX_BOT_TOKEN;
+  const prevSel = hadAny ? (prevCh.max && prevCh.telegram ? "3" : prevCh.telegram ? "2" : "1") : "1";
+  const chChoice = (await ask(`  ${t("Channel", "Канал")} (1/2/3)`, prevSel)).trim();
+  const useMax = chChoice === "1" || chChoice === "3";
+  const useTelegram = chChoice === "2" || chChoice === "3";
+  out.IVA_CHANNELS = [useMax ? "max" : null, useTelegram ? "telegram" : null].filter(Boolean).join(",");
+  console.log(`  → ${out.IVA_CHANNELS}`);
+
+  if (useTelegram) {
+    console.log(`\n  ${C.b}Deepgram${C.x} — ${t("voice and video transcription (Telegram)", "расшифровка голоса и видео (Telegram)")}`);
+    console.log(`  ${t("Where to get the key", "Где взять ключ")}: ${C.c}https://console.deepgram.com${C.x}`);
+    console.log(`    1) ${t("sign up (free starter credit)", "зарегистрируйтесь (дают бесплатный стартовый кредит)")}`);
+    console.log("    2) API Keys → Create a New API Key");
+    console.log(`    3) ${t("copy the key", "скопируйте ключ")}`);
+    out.DEEPGRAM_API_KEY = await askRequired(`  ${t("Paste the Deepgram API key", "Вставьте Deepgram API key")}`, {
+      existing: process.env.DEEPGRAM_API_KEY || existing.DEEPGRAM_API_KEY || "",
+      validate: deepgramCheck,
+    });
+    out.DEEPGRAM_LANGUAGE = await ask(`  ${t("Recognition language (multi = auto ru/uz/en)", "Язык распознавания (multi = авто ru/uz/en)")}`, out.DEEPGRAM_LANGUAGE || "multi");
+  }
 
   // ── Web search: provider + key ────────────────────────────────────
   // Without a key for the chosen provider web_search is off (DuckDuckGo gives a captcha from a server IP).
@@ -595,8 +625,17 @@ async function main() {
     out.MEMORY_SEARCH_MODE = "grep";
   }
 
-  // ── Step 3: Telegram bot ──────────────────────────────────────────
-  head(3, t("Telegram bot — how you talk to Iva", "Telegram-бот — через него вы говорите с Iva"));
+  // ── Step 3/4: bot(s) and access ───────────────────────────────────
+  if (useMax) {
+    head(3, t("MAX bot — how you talk to Iva", "MAX-бот — через него вы говорите с Iva"));
+    await setupMaxChannel({
+      io: { ask, askRequired, say: (m) => console.log(m), C, t },
+      existing,
+      out,
+    });
+  }
+  if (useTelegram) {
+  head(useMax ? "3b" : 3, t("Telegram bot — how you talk to Iva", "Telegram-бот — через него вы говорите с Iva"));
   console.log(`  ${t("Create a bot via @BotFather in Telegram:", "Создайте бота у @BotFather в Telegram:")}`);
   console.log(`    1) ${t("open a chat with @BotFather", "откройте чат с @BotFather")}`);
   console.log(`    2) ${t("send /newbot", "отправьте /newbot")}`);
@@ -620,7 +659,7 @@ async function main() {
   out.TELEGRAM_WEBHOOK_SECRET_TOKEN = existing.TELEGRAM_WEBHOOK_SECRET_TOKEN || randomBytes(24).toString("hex");
 
   // ── Step 4: trusted users (loop until ≥1 ID) ──────────────────────
-  head(4, t("Access — who the bot answers at all", "Доступ — кому бот вообще отвечает"));
+  head(useMax ? "4b" : 4, t("Access — who the bot answers at all", "Доступ — кому бот вообще отвечает"));
   console.log(`  ${C.y}${t("IMPORTANT:", "ВАЖНО:")}${C.x} ${t("Iva answers ONLY trusted Telegram IDs.", "Iva отвечает ТОЛЬКО доверенным Telegram ID.")}`);
   console.log(`  ${t("Without at least one ID the bot stays silent to everyone (that's how your data is protected).", "Без хотя бы одного ID бот промолчит всем (так ваши данные защищены).")}`);
   const ids = new Set(
@@ -658,6 +697,7 @@ async function main() {
   out.TELEGRAM_ALLOWED_USER_IDS = [...ids].join(",");
   out.TELEGRAM_DIGEST_CHAT_ID = existing.TELEGRAM_DIGEST_CHAT_ID || [...ids][0] || "";
   console.log(`  → ${t("access granted to ID", "доступ разрешён ID")}: ${C.g}${out.TELEGRAM_ALLOWED_USER_IDS}${C.x}`);
+  }
 
   // ── Step 5: timezone, vault, port ─────────────────────────────────
   head(5, t("Timezone and memory storage", "Часовой пояс и хранилище памяти"));
@@ -701,8 +741,10 @@ async function main() {
   console.log(`${C.g}${C.b}  ✓ ${STAGING_CONFIG
     ? t("Ready — settings validated for apply", "Готово к применению — настройки проверены")
     : t("Done — everything written to .env", "Готово — всё записано в .env")}${C.x}`);
-  console.log(`  ${t("Provider", "Провайдер")}: ${provider} · ${t("Model", "Модель")}: ${C.g}${chosenModel}${C.x} · Deepgram: ${out.DEEPGRAM_LANGUAGE} · ${t("Bot", "Бот")}: ${C.g}@${out.TELEGRAM_BOT_USERNAME}${C.x}`);
-  console.log(`  ${t("Access", "Доступ")}: ${out.TELEGRAM_ALLOWED_USER_IDS} · TZ: ${out.ASSISTANT_TIMEZONE} · vault: ${out.ASSISTANT_VAULT_DIR} · ${t("lang", "язык")}: ${out.AGENT_LANGUAGE}`);
+  console.log(`  ${t("Provider", "Провайдер")}: ${provider} · ${t("Model", "Модель")}: ${C.g}${chosenModel}${C.x} · ${t("Channels", "Каналы")}: ${C.g}${out.IVA_CHANNELS}${C.x}`);
+  if (useMax) console.log(`  MAX: ${C.g}@${out.MAX_BOT_USERNAME || "?"}${C.x} · ${t("Access", "Доступ")}: ${out.MAX_ALLOWED_USER_IDS}`);
+  if (useTelegram) console.log(`  Telegram: ${C.g}@${out.TELEGRAM_BOT_USERNAME}${C.x} · ${t("Access", "Доступ")}: ${out.TELEGRAM_ALLOWED_USER_IDS} · Deepgram: ${out.DEEPGRAM_LANGUAGE}`);
+  console.log(`  TZ: ${out.ASSISTANT_TIMEZONE} · vault: ${out.ASSISTANT_VAULT_DIR} · ${t("lang", "язык")}: ${out.AGENT_LANGUAGE}`);
   hr();
   rl.close();
 }

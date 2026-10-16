@@ -52,6 +52,8 @@ export interface MaxWebhookDeps {
     nothingRunning: string;
     needsBridge: string;
   };
+  /** Дописать реплику пользователя в дневной журнал vault (ночная память). Сбой не должен ронять приём. */
+  logInbound?(text: string): void;
   sendTimeoutMs?: number;
   log?: (msg: string) => void;
 }
@@ -160,6 +162,11 @@ export async function handleMaxWebhook(request: Request, deps: MaxWebhookDeps): 
         // их обслуживает мост (iva-max-bridge). Раз команда дошла сюда, моста нет.
         deps.reply(event.userId, c.needsBridge);
       } else if (event.kind === "message") {
+        try {
+          deps.logInbound?.(event.text);
+        } catch (e) {
+          log(`daily log failed: ${(e as Error).message}`);
+        }
         const sanitized = sanitizeInbound(event.text);
         const parts: string[] = [];
         if (sanitized.blocked || hasInboundAttackSignal(sanitized)) {

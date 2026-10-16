@@ -97,9 +97,11 @@ Full architecture and search internals: [docs/memory.md](docs/memory.md).
 
 ## Quick start
 
-1. Get a bot token from [@BotFather](https://t.me/BotFather).
-2. Run the one-line installer above on any Ubuntu/Debian box — a fresh VPS or your own machine.
-3. Message your bot. The wizard picks your Telegram ID out of that message, finishes setup, and Iva confirms right in the chat that it's live.
+1. Create a bot and get its token: **MAX** ([business.max.ru](https://business.max.ru), recommended — no Telegram needed) or Telegram ([@BotFather](https://t.me/BotFather)).
+2. Run the one-line installer above on any Ubuntu/Debian box — a fresh VPS or your own machine, and pick the channel in the wizard.
+3. Message your bot. The wizard picks your user ID out of that message, finishes setup, and Iva confirms right in the chat that it's live.
+
+MAX-only installs never start Telegram services and need no public HTTPS: [docs/max.md](docs/max.md).
 
 Headless installs take `--skip-setup` or `--non-interactive`. Wizard walkthrough and an SSH primer for first-time VPS owners: [docs/install.md](docs/install.md).
 

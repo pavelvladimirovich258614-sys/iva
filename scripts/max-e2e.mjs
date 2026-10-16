@@ -230,6 +230,25 @@ async function main() {
 
     const files = JSON.stringify(await readFile(join(app, "data/max/state.json"), "utf8"));
     assert(files.length > 2, "state persisted under data/max");
+    // ── фоновые задачи в MAX-only: дайджест и отчёт памяти доставляются в MAX ──
+    setPhase("background-jobs");
+    const jobEnv = { ...env, ASSISTANT_HOST: base, ASSISTANT_BEARER: "e2e-bearer" };
+    const digestBefore = maxApi.received.length;
+    await run(process.execPath, [join(app, "scripts/daily-digest.ts")], { cwd: app, env: jobEnv });
+    assert(maxApi.received.length === digestBefore + 1, "digest delivered to MAX");
+    const dg = maxApi.received.at(-1);
+    assert(dg.query === `?user_id=${USER}`, `digest addressed by user_id: ${dg.query}`);
+    assert(dg.text === "REPLICA_OK" && dg.body.format === "markdown", "digest text/format");
+    const rollBefore = maxApi.received.length;
+    await run(process.execPath, [join(app, "scripts/memory/rollup.ts"), "daily"], { cwd: app, env: jobEnv });
+    assert(maxApi.received.length === rollBefore + 1, "daily memory report delivered to MAX");
+    // и при полном отсутствии канала задачи не падают (память важнее доставки)
+    const quietEnv = { ...jobEnv };
+    for (const k of ["MAX_BOT_TOKEN", "MAX_ALLOWED_USER_IDS", "MAX_WEBHOOK_SECRET", "IVA_CHANNELS"]) delete quietEnv[k];
+    const quietBefore = maxApi.received.length;
+    await run(process.execPath, [join(app, "scripts/memory/rollup.ts"), "daily"], { cwd: app, env: quietEnv });
+    assert(maxApi.received.length === quietBefore, "no channel → nothing sent, rollup still succeeds");
+
     // ── MAX-bridge: polling вместо webhook, управление из MAX ──────────────────
     setPhase("bridge-start");
     const callback = (payload, mid, userId = USER, id = `cb-${Math.random().toString(36).slice(2)}`) => ({

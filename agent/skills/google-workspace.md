@@ -68,7 +68,7 @@ gws tasks tasks delete --params '{"tasklist":"@default","task":"TASK_ID"}'
 3. Ключи: https://console.cloud.google.com/apis/credentials
    → **Create credentials → OAuth client ID** → тип **Desktop app** → Create → **Download JSON**.
 
-**Шаг 2. Передать ключ мне.** Пусть пользователь пришлёт скачанный JSON-файл сюда, в Telegram
+**Шаг 2. Передать ключ мне.** Пусть пользователь пришлёт скачанный JSON-файл сюда, в чат
 как документ. Сохрани его на сервере в `~/.config/gws/client_secret.json` (создай папку при
 необходимости). Файл — секрет: не пересылай его наружу и не печатай содержимое в чат.
 

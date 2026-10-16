@@ -5,7 +5,7 @@
 #   curl -fsSL https://raw.githubusercontent.com/smixs/iva/main/install.sh | bash
 #
 # Installs system dependencies (git, gh, python3, ffmpeg, pandoc, poppler), uv, Node 24+ (nvm),
-# npm dependencies, runs an interactive setup (Ollama + model + Telegram +
+# npm dependencies, runs an interactive setup (Ollama + model + MAX/Telegram +
 # Deepgram + timezone + vault), builds the agent and sets up a systemd user service plus
 # memory timers. The live vault is initialized as a separate git repo for backup.
 #
@@ -534,7 +534,7 @@ else
 fi
 
 # ─────────────────────────────────────────────────────────────────────────
-# 6. Interactive setup (provider + model + Telegram + Deepgram + TZ + vault)
+# 6. Interactive setup (provider + model + channel MAX/Telegram + TZ + vault)
 #    Reads /dev/tty → works with `curl | bash` too. Without a terminal — defer it.
 # ─────────────────────────────────────────────────────────────────────────
 SETUP_DONE=false
@@ -600,18 +600,12 @@ elif prompt_yes_no "$(t "Set up autostart via systemd (service + memory timers)?
   loginctl enable-linger "$USER" >/dev/null 2>&1 || warn "$(t "couldn't enable linger (the service won't start before login)" "не удалось включить linger (сервис не стартует до логина)")"
   ok "$(t "Service started: systemctl --user status iva" "Сервис запущен: systemctl --user status iva")"
 
-  # Instant confirmation in Telegram (direct Bot API — doesn't depend on the server).
-  _bot="$(grep -E '^TELEGRAM_BOT_TOKEN=' .env | head -n1 | cut -d= -f2- | tr -d '"' || true)"
-  _chat="$(grep -E '^TELEGRAM_DIGEST_CHAT_ID=' .env | head -n1 | cut -d= -f2- | tr -d '"' || true)"
-  if [ -z "$_chat" ]; then
-    _chat="$(grep -E '^TELEGRAM_ALLOWED_USER_IDS=' .env | head -n1 | cut -d= -f2- | tr -d '"' | cut -d, -f1 || true)"
-  fi
-  if [ -n "$_bot" ] && [ -n "$_chat" ]; then
-    curl -s "https://api.telegram.org/bot$_bot/sendMessage" \
-      --data-urlencode "chat_id=$_chat" \
-      --data-urlencode "text=$(t "✅ Iva is installed and online. Send me a message — I'll reply." "✅ Iva установлена и на связи. Напишите мне сообщение — отвечу.")" >/dev/null 2>&1 \
-      && ok "$(t "Sent you a confirmation in Telegram — open the chat with the bot" "Отправил вам подтверждение в Telegram — откройте чат с ботом")" \
-      || warn "$(t "couldn't send the confirmation (the bot still works — just message it)" "не смог отправить подтверждение (бот всё равно работает — просто напишите ему)")"
+  # Instant confirmation in the configured channel (MAX or Telegram, direct Bot API — doesn't
+  # depend on the server). Nothing is sent when no channel is configured.
+  if node "$PROJECT_DIR/bin/iva.mjs" _confirm "$(t "✅ Iva is installed and online. Send me a message — I'll reply." "✅ Iva установлена и на связи. Напишите мне сообщение — отвечу.")" >/dev/null 2>&1; then
+    ok "$(t "Sent you a confirmation — open the chat with the bot" "Отправил вам подтверждение — откройте чат с ботом")"
+  else
+    warn "$(t "couldn't send the confirmation (the bot still works — just message it)" "не смог отправить подтверждение (бот всё равно работает — просто напишите ему)")"
   fi
 fi
 
@@ -634,7 +628,7 @@ if [ "$SETUP_DONE" != true ]; then
 fi
 echo "  ${c_bold}$(t "Commands (${c_green}iva${c_reset}${c_bold} — from anywhere):" "Команды (${c_green}iva${c_reset}${c_bold} — из любого места):")${c_reset}"
 echo "    iva update        $(t "update (git pull + build + restart)" "обновить (git pull + сборка + рестарт)")"
-echo "    iva config        $(t "configure (model/Telegram/Deepgram/TZ/vault)" "настройка (модель/Telegram/Deepgram/TZ/vault)")"
+echo "    iva config        $(t "configure (model/channel MAX·Telegram/TZ/vault)" "настройка (модель/канал MAX·Telegram/TZ/vault)")"
 echo "    iva doctor        $(t "diagnose and auto-fix the install" "диагностика и авто-починка установки")"
 echo "    iva status        $(t "services and timers status" "статус сервисов и таймеров")"
 echo "    iva help          $(t "all commands" "все команды")"
@@ -643,7 +637,13 @@ echo "  ${c_yellow}${c_bold}$(t "Vault backup in git" "Vault-бэкап в git")
 echo "    gh auth login"
 echo "    gh repo create <user>/iva-vault --private --source=\"$VAULT_PATH\" --remote=origin --push"
 echo
-echo "  ${c_green}${c_bold}$(t "✅ The bot is ready" "✅ Бот готов")${c_reset} — $(t "just message it in Telegram." "просто напишите ему в Telegram.")"
-echo "    $(t "Bot status:" "Статус бота:")  systemctl --user status iva-telegram-poll"
-echo "    $(t "Bot logs:" "Логи бота:")    journalctl --user -u iva-telegram-poll -f"
+_chan_info="$(node "$PROJECT_DIR/bin/iva.mjs" _channel-info 2>/dev/null || true)"
+_chan_label="${_chan_info%%|*}"
+_chan_units="${_chan_info#*|}"
+[ -n "$_chan_label" ] && [ "$_chan_label" != "none" ] || _chan_label="MAX / Telegram"
+_chan_main="${_chan_units%% *}"
+[ -n "$_chan_main" ] && [ "$_chan_main" != "$_chan_info" ] || _chan_main="iva"
+echo "  ${c_green}${c_bold}$(t "✅ The bot is ready" "✅ Бот готов")${c_reset} — $(t "just message it in $_chan_label." "просто напишите ему в $_chan_label.")"
+echo "    $(t "Bot status:" "Статус бота:")  systemctl --user status $_chan_main"
+echo "    $(t "Bot logs:" "Логи бота:")    journalctl --user -u $_chan_main -f"
 echo

@@ -1,6 +1,6 @@
 ---
 description: >-
-  Send Telegram rich-media posts and reports via the bot (Bot API 10.1 sendRichMessage) - text, inline images, tables, headings, lists, quotes, collapsible blocks, formulas, collages/slideshows ALL in one message bubble. This is the REQUIRED transport for reports (see the red-banner rule in the persona). Also use when asked for a rich post, a message with images between text, a post with a table, "rich message", "картинка в середине текста". NOT for plain text replies (just answer) or simple albums.
+  TELEGRAM-ONLY (unavailable when the chat channel is MAX - then answer in plain text). Send Telegram rich-media posts and reports via the bot (Bot API 10.1 sendRichMessage) - text, inline images, tables, headings, lists, quotes, collapsible blocks, formulas, collages/slideshows ALL in one message bubble. This is the REQUIRED transport for reports (see the red-banner rule in the persona). Also use when asked for a rich post, a message with images between text, a post with a table, "rich message", "картинка в середине текста". NOT for plain text replies (just answer) or simple albums.
 ---
 
 # rich-post — Telegram rich messages via the bot
