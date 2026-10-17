@@ -190,7 +190,7 @@ const WINDOW_LABEL = {
   last: "Last turn", today: "Today", week: "Last 7 days", month: "This month",
   "by-model": "By model", "by-source": "By source",
 };
-const SOURCE_LABEL = { telegram: "chat", http: "background (cron/digest)", unknown: "other" };
+const SOURCE_LABEL = { telegram: "chat", max: "chat", http: "background (cron/digest)", unknown: "other" };
 // channel.kind приходит как "channel:telegram" (канал) или "http" (eve/client) — нормализуем.
 const src = (k) => {
   const key = String(k ?? "").replace(/^channel:/, "");

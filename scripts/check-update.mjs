@@ -1,13 +1,12 @@
 #!/usr/bin/env node
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { notifyConfigured, sendUpdateOfferVia } from "./lib/notify.mjs";
 import { acquireUpdateLock, releaseUpdateLock } from "./lib/update-safety.mjs";
 import {
   inspectUpstream,
   markVersionNotified,
-  notificationChat,
   readNotifiedVersion,
-  sendUpdateOffer,
   updateOffer,
 } from "./lib/update-check.mjs";
 
@@ -22,13 +21,11 @@ export async function runDailyUpdateCheck({
   root = ROOT,
   env = process.env,
   inspectImpl = inspectUpstream,
-  sendImpl = sendUpdateOffer,
+  sendImpl = sendUpdateOfferVia,
   readStateImpl = readNotifiedVersion,
   writeStateImpl = markVersionNotified,
 } = {}) {
-  const token = String(env.TELEGRAM_BOT_TOKEN ?? "").trim();
-  const chatId = notificationChat(env);
-  if (!token || !chatId) return { status: "not-configured" };
+  if (!notifyConfigured(env)) return { status: "not-configured" };
 
   const storage = dataDir(root, env);
   const lock = acquireUpdateLock(storage, `daily-check-${process.pid}-${Date.now()}`);
@@ -39,7 +36,7 @@ export async function runDailyUpdateCheck({
     if (await readStateImpl(storage) === info.remoteVersion) return { status: "already-notified", info };
 
     const offer = updateOffer(info.localVersion, info.remoteVersion, env.AGENT_LANGUAGE === "ru" ? "ru" : "en");
-    await sendImpl({ token, chatId, offer });
+    await sendImpl({ env, offer });
     await writeStateImpl(storage, info.remoteVersion);
     return { status: "notified", info };
   } finally {

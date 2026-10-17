@@ -72,9 +72,20 @@ async function readBody(req) {
 }
 
 /** Стартует mock-провайдер на 127.0.0.1:0; handle: { baseUrl, requests, close }. */
-export async function startMockOpenAiServer() {
+export async function startMockOpenAiServer({ delayFor } = {}) {
   const requests = [];
+  const state = { modelsStatus: 200 }; // тесты могут «ронять» каталог моделей
   const server = createServer(async (req, res) => {
+    if (req.method === "GET" && req.url === "/v1/models") {
+      if (state.modelsStatus !== 200) {
+        res.writeHead(state.modelsStatus, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: { message: "catalog down" } }));
+        return;
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ object: "list", data: [{ id: MODEL }, { id: "iva-alt" }] }));
+      return;
+    }
     if (req.method !== "POST" || req.url !== "/v1/chat/completions") {
       res.writeHead(404, { "content-type": "application/json" });
       res.end(JSON.stringify({ error: { message: `no route: ${req.method} ${req.url}` } }));
@@ -90,6 +101,8 @@ export async function startMockOpenAiServer() {
     }
     requests.push(body);
     const text = chooseResponse(body);
+    const delay = delayFor?.(lastUserText(Array.isArray(body?.messages) ? body.messages : [])) ?? 0;
+    if (delay > 0) await new Promise((r) => setTimeout(r, delay));
     if (body?.stream) {
       res.writeHead(200, {
         "content-type": "text/event-stream",
@@ -111,6 +124,7 @@ export async function startMockOpenAiServer() {
   return {
     baseUrl: `http://127.0.0.1:${port}/v1`,
     requests,
+    state,
     close: () => new Promise((resolve) => server.close(resolve)),
   };
 }

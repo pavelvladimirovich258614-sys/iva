@@ -1,20 +1,18 @@
-// VPS cron-runner: asks the agent for a morning digest and sends it to Telegram.
+// VPS cron-runner: asks the agent for a morning digest and delivers it to the owner (MAX or Telegram).
 // Launched from system cron (see README/implementation-notes).
 //
 //   0 5 * * *  cd /srv/assistant && node --env-file=.env scripts/daily-digest.ts >> /var/log/assistant-cron.log 2>&1
 //
-// Requires: a running agent (eve start) and the TELEGRAM_BOT_TOKEN, TELEGRAM_DIGEST_CHAT_ID variables.
+// Requires: a running agent (eve start) and a configured notification channel (see scripts/lib/notify.mjs).
 import { Client } from "eve/client";
-import { sendTelegramHtml } from "./lib/telegram-send.mjs";
+import { notifyConfigured, sendReport } from "./lib/notify.mjs";
 
 const PORT = process.env.IVA_PORT ?? "8723";
 const HOST = process.env.ASSISTANT_HOST ?? `http://127.0.0.1:${PORT}`;
-const BOT = process.env.TELEGRAM_BOT_TOKEN;
-const CHAT = process.env.TELEGRAM_DIGEST_CHAT_ID;
 const BEARER = process.env.ASSISTANT_BEARER; // needed if the eve channel in prod requires auth
 
-if (!BOT || !CHAT) {
-  console.error("TELEGRAM_BOT_TOKEN and TELEGRAM_DIGEST_CHAT_ID are required");
+if (!notifyConfigured()) {
+  console.error("digest: no notification channel configured (set MAX_BOT_TOKEN + MAX_ALLOWED_USER_IDS, or Telegram) — nothing to send");
   process.exit(1);
 }
 
@@ -37,16 +35,16 @@ if (result.status === "failed" || !result.message) {
   process.exit(1);
 }
 
-// The markdown → Telegram-HTML conversion + self-heal live in a shared helper.
-const r = await sendTelegramHtml(BOT, CHAT, result.message);
+// Channel selection, formatting and self-heal live in the shared notify helper.
+const r = await sendReport(result.message);
 if (r.fellBack) {
   await session.send(
-    `The last digest failed Telegram parse_mode=HTML (${r.error}) and was sent as plain text — ` +
+    `The last digest failed ${r.channel} formatting (${r.error}) and was sent as plain text — ` +
       "format more simply next time: **bold**, `code`, lists, no raw HTML.",
   );
 }
 if (!r.ok) {
-  console.error("digest: Telegram send failed:", r.error);
+  console.error(`digest: ${r.channel} send failed:`, r.error);
   process.exit(1);
 }
-console.log("Digest sent to Telegram.");
+console.log(`Digest sent via ${r.channel}.`);

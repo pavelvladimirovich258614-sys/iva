@@ -5,8 +5,8 @@
 //
 // Runs the autograph scripts (graph.health / engine.decay / moc.generate /
 // dedup / link_cleanup) on the vault via `uv run`, then commits and pushes the vault repo.
-// Guards: no git-remote/credentials → alert admin on Telegram (gh auth login + git remote),
-// push is skipped. Health score drop → alert on Telegram. Plain Node orchestration.
+// Guards: no git-remote/credentials → alert the owner (MAX/Telegram) (gh auth login + git remote),
+// push is skipped. Health score drop → alert the owner. Plain Node orchestration.
 import { spawnSync } from "node:child_process";
 import { copyFileSync, existsSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
@@ -18,7 +18,7 @@ import {
   recordSkippedOversize,
   scanOversizeWorkingTreeFiles,
 } from "../lib/memory-maintenance.mjs";
-import { notificationChat } from "../lib/notification-chat.mjs";
+import { notifyConfigured, sendNotice } from "../lib/notify.mjs";
 import { clampCore } from "./core-clamp.mjs";
 
 const VAULT = resolve(process.env.ASSISTANT_VAULT_DIR ?? "vault");
@@ -26,8 +26,6 @@ const VAULT = resolve(process.env.ASSISTANT_VAULT_DIR ?? "vault");
 // Absolute paths, because every script is spawned with cwd = VAULT (they take "." as the vault).
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const SCRIPTS = resolve(ROOT, "scripts/autograph");
-const BOT = process.env.TELEGRAM_BOT_TOKEN;
-const CHAT = notificationChat(); // admin chat
 const TZ = process.env.ASSISTANT_TIMEZONE ?? process.env.TZ ?? "UTC";
 
 if (!existsSync(VAULT)) {
@@ -52,17 +50,14 @@ function run(cmd: string, args: string[], cwd = VAULT) {
   return { status: r.status ?? (r.error ? 1 : 0), stdout: r.stdout ?? "", stderr: r.stderr ?? "" };
 }
 
-async function telegram(text: string): Promise<void> {
-  if (!BOT || !CHAT) {
-    console.error("doctor: no TELEGRAM_BOT_TOKEN/TELEGRAM_DIGEST_CHAT_ID — alert not sent:", text);
+// Owner alert via the configured channel (MAX/Telegram). Unconfigured delivery is logged, not fatal.
+async function alertOwner(text: string): Promise<void> {
+  if (!notifyConfigured()) {
+    console.error("doctor: no notification channel configured — alert not sent:", text);
     return;
   }
-  const res = await fetch(`https://api.telegram.org/bot${BOT}/sendMessage`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ chat_id: CHAT, text }),
-  });
-  if (!res.ok) console.error("doctor: Telegram sendMessage failed:", res.status, await res.text());
+  const r = await sendNotice(text);
+  if (!r.ok) console.error(`doctor: ${r.channel} alert failed:`, r.error);
 }
 
 // Health score is read from the history that graph.py health appends after each run.
@@ -136,7 +131,7 @@ if (process.env.MEMORY_SEARCH_MODE === "hybrid") {
 }
 
 if (failures.length) {
-  await telegram(
+  await alertOwner(
     `doctor: vault maintenance partially failed (${failures.join(", ")}) for ${today}. ` +
       `Check that the server has uv/Python and the vault is initialized (schema.json + cards).`,
   );
@@ -166,7 +161,7 @@ if (existsSync(corePath)) {
       newCore.length > CORE_CAP
         ? " Protected headings, pointers or unknown sections still exceed the cap."
         : "";
-    await telegram(
+    await alertOwner(
       `CORE.md exceeded its ${CORE_CAP}-char cap (${today}); doctor clamped it ` +
         `${oldCore.length} → ${newCore.length} chars. Pointers were preserved.${protectedOverflow}`,
     );
@@ -179,7 +174,7 @@ if (history.length >= 2) {
   const cur = history[history.length - 1]?.health_score;
   const prev = history[history.length - 2]?.health_score;
   if (typeof cur === "number" && typeof prev === "number" && cur < prev) {
-    await telegram(`Vault health dropped: ${prev} → ${cur}/100 (${today}). Check vault/.graph/report.md.`);
+    await alertOwner(`Vault health dropped: ${prev} → ${cur}/100 (${today}). Check vault/.graph/report.md.`);
   }
 }
 
@@ -199,7 +194,7 @@ try {
     `vault: не удалось проверить размеры файлов перед git add (${detail}); ` +
     "ночной коммит отложен, чтобы не повредить историю.";
   console.warn(`doctor: ${message}`);
-  await telegram(message);
+  await alertOwner(message);
   process.exit(1);
 }
 
@@ -211,7 +206,7 @@ if (oversized.length) {
       "ночной cleanup должен его ужать, коммит отложен",
   );
   for (const line of lines) console.warn(`doctor: ${line}`);
-  await telegram(`vault:\n${lines.join("\n")}`);
+  await alertOwner(`vault:\n${lines.join("\n")}`);
   process.exit(1);
 }
 
@@ -241,7 +236,7 @@ function ensureRemote(): string {
 
 const remoteUrl = ensureRemote();
 if (!remoteUrl) {
-  await telegram(
+  await alertOwner(
     "vault has no git remote and gh is not authenticated — memory is not being backed up. " +
       "On the server run `gh auth login` (with repo scope); the nightly doctor will then create " +
       "a private iva-vault repo and back up automatically.",
@@ -266,7 +261,7 @@ if (push.status !== 0) {
           `and verify remote access (cd ${VAULT} && git push).`
         : `vault: git push failed: ${error.firstLine}`;
   console.warn(`doctor: ${message}`);
-  await telegram(message);
+  await alertOwner(message);
   process.exit(1);
 }
 

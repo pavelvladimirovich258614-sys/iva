@@ -10,7 +10,7 @@ export const UPDATE_LOADER = {
   fallback: "◇",
 };
 
-const COPY = {
+export const UPDATE_COPY = {
   en: {
     protect: ["Saving your changes", "Changes saved", "Couldn't save your changes"],
     fetch: ["Getting the update", "Update received", "Couldn't get the update"],
@@ -34,7 +34,7 @@ const COPY = {
 export function createTelegramUpdateReporter({ token, job, env, fetchImpl = fetch, sleepImpl } = {}) {
   if (!token || !job?.chatId || !job?.messageId) return null;
   const lang = job.locale === "ru" ? "ru" : "en";
-  const copy = COPY[lang];
+  const copy = UPDATE_COPY[lang];
   const api = `https://api.telegram.org/bot${token}`;
   let currentMessageId = job.messageId;
   let currentPhase = null;

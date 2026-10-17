@@ -42,6 +42,17 @@ async function promptKey(st, ctx, provider) {
       [ctx.backRow(PARENT)],
     );
   }
+  if (ctx.secretsInChat && !ctx.secretsInChat()) {
+    st.awaitText = null;
+    return ctx.flows.screen(
+      st,
+      ctx.tr(
+        `Keys are NOT entered in chat. On the server run:\n  iva secret set ${cat.keyVar}\nthen iva restart.`,
+        `Ключи в чат не вводятся. На сервере выполни:\n  iva secret set ${cat.keyVar}\nзатем iva restart.`,
+      ),
+      [ctx.backRow(PARENT)],
+    );
+  }
   st.awaitText = { kind: "apikey", secret: true, data: { provider, keyVar: cat.keyVar, returnScreen: SID } };
   const text = [
     ctx.tr(`${cat.label} search key`, `Ключ поиска ${cat.label}`),
