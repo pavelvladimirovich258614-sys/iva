@@ -127,6 +127,7 @@ export async function startMockMax({ token, webhookTarget = () => null }) {
       const f = media.get(id);
       mediaRequests.push({ id, authorization: req.headers.authorization ?? null });
       if (!f) { res.writeHead(404); return res.end(); }
+      if (f.delayMs) await sleep(f.delayMs);
       if (f.status && f.status !== 200) { res.writeHead(f.status, f.status >= 300 && f.status < 400 && f.location ? { location: f.location } : {}); return res.end(); }
       res.writeHead(200, { "content-type": f.contentType ?? "application/octet-stream", "content-length": f.bytes.length });
       return res.end(f.bytes);
@@ -250,9 +251,9 @@ export async function startMockMax({ token, webhookTarget = () => null }) {
   const api = {
     received, edits, answers, deletes, commands, subs, pollLog, state, timeline, mediaRequests, uploads, uploadAuth, deliveredFiles,
     /** Кладёт файл «на CDN MAX» и возвращает его URL (для payload.url входящего вложения). */
-    hostFile(bytes, { contentType, status, location } = {}) {
+    hostFile(bytes, { contentType, status, location, delayMs } = {}) {
       const id = `f${++state.mediaSeq}`;
-      media.set(id, { bytes: Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes), contentType, status, location });
+      media.set(id, { bytes: Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes), contentType, status, location, delayMs });
       return `${api.url}/media/${id}`;
     },
     expireFile(url) { const f = media.get(new URL(url).pathname.slice(7)); if (f) f.status = 410; },

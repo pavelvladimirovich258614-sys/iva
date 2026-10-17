@@ -56,6 +56,27 @@ function completionJson(text) {
   };
 }
 
+// Ответ с вызовом инструментов (OpenAI chat.completions, tool_calls) — для e2e-сценариев с реальными инструментами Ивы.
+function toolCallsOf(calls) {
+  return calls.map((c, i) => ({ id: `call_${Date.now().toString(36)}_${i}`, type: "function", function: { name: c.name, arguments: JSON.stringify(c.args ?? {}) } }));
+}
+function completionToolJson(calls) {
+  return {
+    id: "chatcmpl-replica", object: "chat.completion", created: 1, model: MODEL,
+    choices: [{ index: 0, message: { role: "assistant", content: null, tool_calls: toolCallsOf(calls) }, finish_reason: "tool_calls" }],
+    usage: { prompt_tokens: 8, completion_tokens: 4, total_tokens: 12 },
+  };
+}
+function streamToolChunks(calls) {
+  const base = { id: "chatcmpl-replica", object: "chat.completion.chunk", created: 1, model: MODEL };
+  const tc = toolCallsOf(calls).map((t, index) => ({ index, ...t }));
+  return [
+    { ...base, choices: [{ index: 0, delta: { role: "assistant", content: null, tool_calls: tc }, finish_reason: null }] },
+    { ...base, choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] },
+    { ...base, choices: [], usage: { prompt_tokens: 8, completion_tokens: 4, total_tokens: 12 } },
+  ];
+}
+
 function streamChunks(text) {
   const base = { id: "chatcmpl-replica", object: "chat.completion.chunk", created: 1, model: MODEL };
   return [
@@ -72,7 +93,7 @@ async function readBody(req) {
 }
 
 /** Стартует mock-провайдер на 127.0.0.1:0; handle: { baseUrl, requests, close }. */
-export async function startMockOpenAiServer({ delayFor } = {}) {
+export async function startMockOpenAiServer({ delayFor, behave } = {}) {
   const requests = [];
   const state = { modelsStatus: 200 }; // тесты могут «ронять» каталог моделей
   const server = createServer(async (req, res) => {
@@ -100,20 +121,23 @@ export async function startMockOpenAiServer({ delayFor } = {}) {
       return;
     }
     requests.push(body);
-    const text = chooseResponse(body);
+    // behave(body) → { text } | { toolCalls: [{ name, args }] } | null (тогда — стандартный сценарий replica-смоука)
+    const scripted = behave?.(body) ?? null;
+    const text = scripted?.text ?? chooseResponse(body);
     const delay = delayFor?.(lastUserText(Array.isArray(body?.messages) ? body.messages : [])) ?? 0;
     if (delay > 0) await new Promise((r) => setTimeout(r, delay));
+    const calls = scripted?.toolCalls;
     if (body?.stream) {
       res.writeHead(200, {
         "content-type": "text/event-stream",
         "cache-control": "no-cache",
         connection: "keep-alive",
       });
-      for (const chunk of streamChunks(text)) res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+      for (const chunk of calls ? streamToolChunks(calls) : streamChunks(text)) res.write(`data: ${JSON.stringify(chunk)}\n\n`);
       res.end("data: [DONE]\n\n");
     } else {
       res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify(completionJson(text)));
+      res.end(JSON.stringify(calls ? completionToolJson(calls) : completionJson(text)));
     }
   });
   await new Promise((resolve, reject) => {

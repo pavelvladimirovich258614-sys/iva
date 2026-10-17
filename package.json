@@ -27,7 +27,8 @@
     "test:update-ui": "node --test scripts/lib/update-ui.test.mjs scripts/lib/update-check.test.mjs",
     "postinstall": "patch-package",
     "test:max-e2e": "node scripts/max-e2e.mjs",
-    "test:max-webhook-e2e": "node scripts/max-webhook-e2e.mjs"
+    "test:max-webhook-e2e": "node scripts/max-webhook-e2e.mjs",
+    "test:max-media-e2e": "node scripts/max-media-e2e.mjs"
   },
   "dependencies": {
     "@ai-sdk/openai": "4.0.15",

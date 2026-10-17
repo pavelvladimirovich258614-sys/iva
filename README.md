@@ -28,6 +28,11 @@ curl -fsSL https://raw.githubusercontent.com/smixs/iva/main/install.sh | bash
 
 ## What's New 🔥
 
+### 17.10.2026
+
+- 🎙️ MAX: send a voice message, a photo or a screenshot, a PDF, Word, Excel or text file — Iva transcribes, looks at it, reads it and answers, and she can send finished files back as real MAX attachments.
+- 🛡️ Attachments are downloaded safely (no internal addresses, size limits, real file type checked) and treated as data, not as instructions.
+
 ### 31.07.2026
 
 #### v0.3.8
@@ -51,11 +56,6 @@ curl -fsSL https://raw.githubusercontent.com/smixs/iva/main/install.sh | bash
 - 📣 Service alerts (nightly memory, backup) arrive without extra configuration.
 - 🛡️ The memory backup no longer breaks on huge files, and failures state their real cause.
 - ⚙️ The eve engine is updated - more resilient to provider stream drops.
-
-### 29.07.2026
-
-- 🖼️ An album of photos with a caption, a forwarded post, or a long split message is understood as one message — one reply instead of several.
-- 📬 The first message after Iva's reply is delivered right away, without a false "queued" notice.
 
 Full history — [CHANGELOG.md](CHANGELOG.md).
 

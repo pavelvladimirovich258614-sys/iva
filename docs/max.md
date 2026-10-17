@@ -1,5 +1,7 @@
 # Iva over MAX (MAX-only setup)
 
+> Voice, photos, documents and sending files: **[max-media.md](max-media.md)**.
+
 MAX is a first-class channel of the **same** Iva agent (same model, memory, skills, MCP tools,
 tasks). Telegram is optional and off by default: `npm run setup` offers *MAX*, *Telegram* or *both*,
 and a MAX-only install never starts `telegram-poll`, the Telegram userbot, or asks for any
@@ -218,7 +220,7 @@ bridge answers `503` when the agent is unavailable so MAX redelivers.
 
 ## Known limits
 
-- Text only: photos, documents, voice and group chats are not handled yet (ignored).
+- Private chats only (groups/channels are ignored). Voice, photos, documents and files are handled — see [max-media.md](max-media.md).
 - Replies are plain text (agent markdown is not converted for regular replies; reports use MAX
   `markdown` with a plain fallback).
 - `/stop` cancels the active turn; a message sent while the agent is busy is queued by Eve and

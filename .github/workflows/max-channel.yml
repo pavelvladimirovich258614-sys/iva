@@ -1,11 +1,12 @@
 name: MAX channel
 
-# Независимая проверка ветки feat/max-channel: не требует PR и слияния в main.
+# Независимая проверка веток feat/max-channel и feat/max-full-media: не требует слияния в main.
 # Запускает всё, что относится к MAX, на реально собранном Eve (Node 24).
 on:
   push:
     branches:
       - feat/max-channel
+      - feat/max-full-media
   workflow_dispatch:
 
 permissions:
@@ -42,6 +43,12 @@ jobs:
           npm --version
           id -u
 
+      - name: Install poppler (pdftotext / pdftoppm for PDF attachments)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils
+          pdftotext -v
+
       - name: Install dependencies
         run: npm ci
 
@@ -57,6 +64,18 @@ jobs:
       - name: Replica smoke (isolated install + mock provider)
         run: npm run replica
 
+      - name: MAX-only install regression (no TELEGRAM_* anywhere)
+        run: node --test scripts/lib/max-only-install.test.mjs scripts/lib/max-setup.test.mjs
+
+      - name: Attachment download / upload security (SSRF, size limits, real-type sniffing, send policy)
+        run: >-
+          node --test
+          agent/lib/safe-http.test.mjs
+          agent/lib/media-docs.test.mjs
+          agent/lib/max-media.test.mjs
+          agent/lib/max-attachments.test.mjs
+          agent/lib/max-upload.test.mjs
+
       - name: MAX e2e - channel and polling bridge (built Eve, mock model, mock MAX API)
         timeout-minutes: 10
         run: npm run test:max-e2e
@@ -64,6 +83,10 @@ jobs:
       - name: MAX e2e - webhook production topology (built Eve, mock model, mock MAX API)
         timeout-minutes: 10
         run: npm run test:max-webhook-e2e
+
+      - name: MAX media e2e - voice, photos, documents, outbound files (webhook AND polling, built Eve)
+        timeout-minutes: 12
+        run: npm run test:max-media-e2e
 
       - name: Secrets must not be tracked
         run: |
