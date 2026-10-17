@@ -1,3 +1,4 @@
+import { MediaFetchError, uploadFileMultipart, type FetchPolicy } from "./safe-http.ts";
 import { parseMaxJson } from "./max-updates.ts";
 
 // Клиент MAX Bot API (схема: github.com/max-messenger/api-schema, schema.yaml).
@@ -54,6 +55,24 @@ export interface MaxSendOptions {
   keyboard?: MaxKeyboard;
 }
 
+/** Тип загрузки POST /uploads?type=… (в схеме: image | video | audio | file; `photo` больше не поддерживается). */
+export type MaxUploadType = "image" | "video" | "audio" | "file";
+
+/** Ответ POST /uploads: адрес загрузки и (для audio/video) токен, выданный сразу. */
+export interface MaxUploadEndpoint {
+  url: string;
+  token: string | null;
+}
+
+/** AttachmentRequest исходящего сообщения: тип + payload, полученный после загрузки. */
+export interface MaxAttachmentRequest {
+  type: MaxUploadType;
+  payload: Record<string, unknown>;
+}
+
+/** Код ошибки MAX, пока загруженное вложение ещё обрабатывается на стороне платформы. */
+export const ATTACHMENT_NOT_READY = "attachment.not.ready";
+
 export interface MaxUpdatesPage {
   updates: unknown[];
   marker: string | null;
@@ -62,6 +81,23 @@ export interface MaxUpdatesPage {
 export interface MaxClient {
   /** Одна попытка POST /messages. Возвращает mid созданного сообщения (если MAX его вернул). */
   sendOnce(target: MaxTarget, text: string, opts?: MaxSendOptions): Promise<{ mid: string | null }>;
+  /** POST /uploads?type=… */
+  getUploadEndpoint(type: MaxUploadType): Promise<MaxUploadEndpoint>;
+  /**
+   * Передаёт файл на адрес загрузки (multipart, поле `data`, потоком с диска) и возвращает
+   * готовый payload вложения. Токен может прийти в ответе загрузки (file, image→photos) либо уже в
+   * ответе /uploads (audio/video) — берётся тот, что есть.
+   */
+  uploadFile(
+    type: MaxUploadType,
+    endpoint: MaxUploadEndpoint,
+    file: { path: string; fileName: string; mimeType?: string },
+    opts?: { signal?: AbortSignal },
+  ): Promise<MaxAttachmentRequest>;
+  /** Одна попытка POST /messages с вложениями. «Вложение ещё не готово» → MaxApiError(code=attachment.not.ready, retryable). */
+  sendAttachment(target: MaxTarget, message: { text?: string; attachment: MaxAttachmentRequest }): Promise<{ mid: string | null }>;
+  /** GET /videos/{token}: ссылки для скачивания входящего видео. */
+  getVideoDetails(token: string): Promise<{ urls: Record<string, string>; duration: number | null; width: number | null; height: number | null }>;
   /** PUT /messages. keyboard: undefined — не менять, [] — убрать, ряды — заменить. */
   editMessage(mid: string, text: string | undefined, opts?: MaxSendOptions & { keyboard?: MaxKeyboard }): Promise<void>;
   deleteMessage(mid: string): Promise<void>;
@@ -121,6 +157,10 @@ function attachments(keyboard: MaxKeyboard | undefined) {
 
 export function createMaxClient(opts: MaxClientOptions): MaxClient {
   const base = (opts.baseUrl ?? MAX_API_BASE).replace(/\/+$/, "");
+  // Адрес загрузки выдаёт MAX; к нему применяются те же SSRF-проверки, что и к скачиванию. Мягче только
+  // тогда, когда сам API — loopback (mock-сервер тестов).
+  const baseHost = new URL(base).hostname;
+  const uploadPolicy: FetchPolicy = ["127.0.0.1", "localhost", "[::1]", "::1"].includes(baseHost) ? { allowHttp: true, allowLoopback: true } : {};
   const doFetch = opts.fetchImpl ?? fetch;
   const timeoutMs = opts.timeoutMs ?? 15_000;
 
@@ -184,6 +224,62 @@ export function createMaxClient(opts: MaxClientOptions): MaxClient {
       const out = await call("POST", "/messages", { query, body: messageBody(text, o) });
       const mid = out?.message?.body?.mid;
       return { mid: typeof mid === "string" && mid ? mid : null };
+    },
+    async getUploadEndpoint(type) {
+      const out = await call("POST", "/uploads", { query: { type } });
+      const url = typeof out?.url === "string" ? out.url : "";
+      if (!url) throw new MaxApiError("MAX did not return an upload URL", 200, false);
+      return { url, token: typeof out?.token === "string" && out.token ? out.token : null };
+    },
+    async uploadFile(type, endpoint, file, o) {
+      let res: { status: number; body: string };
+      try {
+        res = await uploadFileMultipart(endpoint.url, file.path, { ...uploadPolicy, fileName: file.fileName, mimeType: file.mimeType, signal: o?.signal, timeoutMs: 10 * 60_000 });
+      } catch (err) {
+        if (err instanceof MediaFetchError) throw new MaxApiError(`MAX upload failed (${err.code})`, err.status, err.retryable, { code: err.code });
+        throw new MaxApiError(`MAX upload failed: ${(err as Error).name}`, null, true);
+      }
+      if (res.status < 200 || res.status >= 300) {
+        throw new MaxApiError(`MAX upload failed: HTTP ${res.status}`, res.status, res.status === 429 || res.status >= 500);
+      }
+      let parsed: any = null;
+      try {
+        parsed = res.body ? parseMaxJson(res.body) : null;
+      } catch {
+        /* не JSON — ниже будет явная ошибка, если токена нет и в /uploads */
+      }
+      // image: ответ загрузки несёт photos{…token}; payload передаётся как есть.
+      if (type === "image" && parsed && typeof parsed === "object" && parsed.photos && typeof parsed.photos === "object") {
+        return { type, payload: { photos: parsed.photos } };
+      }
+      const token = (typeof parsed?.token === "string" && parsed.token) || endpoint.token;
+      if (!token) throw new MaxApiError("MAX upload finished without an attachment token", res.status, false);
+      return { type, payload: { token } };
+    },
+    async sendAttachment(target, message) {
+      const query = target.chatId ? { chat_id: target.chatId } : { user_id: target.userId };
+      try {
+        const out = await call("POST", "/messages", {
+          query,
+          body: { ...(message.text ? { text: message.text } : {}), attachments: [message.attachment] },
+          timeout: 60_000,
+        });
+        const mid = out?.message?.body?.mid;
+        return { mid: typeof mid === "string" && mid ? mid : null };
+      } catch (err) {
+        // 400 при отправке только что загруженного файла = платформа ещё обрабатывает вложение.
+        if (err instanceof MaxApiError && err.status === 400 && (err.code === ATTACHMENT_NOT_READY || !err.code)) {
+          throw new MaxApiError("MAX attachment is not ready yet", 400, true, { code: ATTACHMENT_NOT_READY });
+        }
+        throw err;
+      }
+    },
+    async getVideoDetails(token) {
+      const out = await call("GET", `/videos/${encodeURIComponent(token)}`);
+      const urls: Record<string, string> = {};
+      for (const [k, v] of Object.entries((out?.urls ?? {}) as Record<string, unknown>)) if (typeof v === "string" && v) urls[k] = v;
+      const n = (v: unknown) => (typeof v === "number" && Number.isFinite(v) ? v : null);
+      return { urls, duration: n(out?.duration), width: n(out?.width), height: n(out?.height) };
     },
     async editMessage(mid, text, o) {
       await call("PUT", "/messages", { query: { message_id: mid }, body: messageBody(text, o) });

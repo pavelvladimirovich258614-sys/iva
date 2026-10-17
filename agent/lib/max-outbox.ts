@@ -7,12 +7,15 @@
 //  - очередь переживает рестарт: start() возобновляет доставку.
 // Семантика: at-least-once. Если ответ на POST потерян (таймаут), повтор может дать дубль.
 
-import { MaxApiError, splitMaxText, type MaxClient } from "./max-api.ts";
-import type { MaxStore } from "./max-store.ts";
+import { statSync } from "node:fs";
+import { ATTACHMENT_NOT_READY, MaxApiError, splitMaxText, type MaxClient } from "./max-api.ts";
+import type { MaxStore, OutboxItem } from "./max-store.ts";
 
 export interface MaxOutbox {
   /** Режет на куски, ставит в очередь (бросает при невозможности сохранить) и запускает доставку. */
   enqueue(userId: string, text: string): number;
+  /** Ставит файл в очередь (загрузка в MAX и отправка — воркером, с повторами). Бросает, если не удалось сохранить. */
+  enqueueFile(userId: string, file: import("./max-store.ts").OutboxAttachmentFile, caption: string): OutboxItem;
   /** Запустить доставку всего, что уже можно слать (используется таймером и тестами). */
   poke(): void;
   start(): void;
@@ -31,6 +34,8 @@ export interface MaxOutboxOptions {
   backoffBaseMs?: number;
   backoffMaxMs?: number;
   tickMs?: number;
+  /** Базовая пауза между попытками, пока MAX обрабатывает вложение (attachment.not.ready). */
+  notReadyBaseMs?: number;
   log?: (msg: string) => void;
 }
 
@@ -66,7 +71,8 @@ export function createMaxOutbox(o: MaxOutboxOptions): MaxOutbox {
       if (gap > 0) await sleep(gap);
       lastStart.set(userId, now());
       try {
-        await o.client.sendOnce({ chatId: head.chatId, userId: head.userId }, head.text);
+        if (head.kind === "file") await deliverFile(head);
+        else await o.client.sendOnce({ chatId: head.chatId, userId: head.userId }, head.text);
         o.store.complete(head.id);
       } catch (err) {
         const e = err as MaxApiError;
@@ -74,12 +80,21 @@ export function createMaxOutbox(o: MaxOutboxOptions): MaxOutbox {
         const status = e instanceof MaxApiError ? e.status : null;
         const name = e instanceof MaxApiError ? (e.code ?? e.name) : ((err as Error)?.name ?? "Error");
         const attempt = head.attempts + 1;
-        const giveUp = !retryable || attempt >= maxAttempts;
-        const delay = Math.max(
-          Math.min(base * 2 ** (attempt - 1), backoffMax),
-          e instanceof MaxApiError ? (e.retryAfterMs ?? 0) : 0,
-        );
+        const notReady = e instanceof MaxApiError && e.code === ATTACHMENT_NOT_READY;
+        // Пока MAX обрабатывает вложение, ждём недолго и чаще: не больше ~1.5 минуты суммарно.
+        const giveUp = !retryable || attempt >= (notReady ? 10 : maxAttempts);
+        const delay = notReady
+          ? Math.min((o.notReadyBaseMs ?? 1000) * 2 ** (attempt - 1), 15_000)
+          : Math.max(Math.min(base * 2 ** (attempt - 1), backoffMax), e instanceof MaxApiError ? (e.retryAfterMs ?? 0) : 0);
         o.store.fail(head.id, { status, name }, giveUp ? null : now() + delay);
+        if (giveUp && head.kind === "file") {
+          // Пользователь не должен остаться в неведении: файл не доставлен — говорим об этом текстом.
+          try {
+            o.store.enqueue(head.userId, [`⚠️ Не удалось отправить файл «${head.file?.fileName ?? "file"}» в MAX (${status ?? "сеть"}, ${name}). Файл остался на сервере.`]);
+          } catch (qerr) {
+            log(`could not queue the file-failure notice: ${(qerr as Error).message}`);
+          }
+        }
         if (giveUp) {
           log(
             `DELIVERY FAILED permanently item=${head.id} attempts=${attempt} status=${status ?? "network"} reason=${name}` +
@@ -90,6 +105,28 @@ export function createMaxOutbox(o: MaxOutboxOptions): MaxOutbox {
         }
       }
     }
+  }
+
+  /** Загрузка (один раз — токен сохраняется в очереди) → отправка вложения. */
+  async function deliverFile(item: OutboxItem) {
+    const f = item.file;
+    if (!f) throw new MaxApiError("file item without file", null, false, { code: "bad-item" });
+    let attachment = f.attachment;
+    if (!attachment) {
+      let size: number;
+      try {
+        const st = statSync(f.path);
+        if (!st.isFile()) throw new Error("not a file");
+        size = st.size;
+      } catch {
+        throw new MaxApiError("file is no longer available", null, false, { code: "file-missing" });
+      }
+      if (size !== f.size) throw new MaxApiError("file changed after it was queued", null, false, { code: "file-changed" });
+      const endpoint = await o.client.getUploadEndpoint(f.uploadType);
+      attachment = await o.client.uploadFile(f.uploadType, endpoint, { path: f.path, fileName: f.fileName, mimeType: f.mimeType });
+      o.store.patchFile(item.id, { attachment, uploadedAt: now() });
+    }
+    await o.client.sendAttachment({ chatId: item.chatId, userId: item.userId }, { text: item.text || undefined, attachment });
   }
 
   function kick(userId: string) {
@@ -113,6 +150,11 @@ export function createMaxOutbox(o: MaxOutboxOptions): MaxOutbox {
       o.store.enqueue(userId, chunks);
       kick(userId);
       return chunks.length;
+    },
+    enqueueFile(userId, file, caption) {
+      const item = o.store.enqueueFile(userId, file, caption.slice(0, 1000));
+      kick(userId);
+      return item;
     },
     poke: kickDue,
     start() {

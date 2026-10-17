@@ -24,6 +24,8 @@ import {
   type MaxConfig,
 } from "./max-updates.ts";
 import type { MaxStore } from "./max-store.ts";
+import type { MediaJob } from "./max-media-jobs.ts";
+import { linkedQuote } from "./max-media-runner.ts";
 
 export interface MaxChannelState {
   userId: string;
@@ -54,6 +56,16 @@ export interface MaxWebhookDeps {
     stopped: string;
     nothingRunning: string;
     needsBridge: string;
+    mediaUnsupported?: string;
+  };
+  /**
+   * Обработка вложений. accept() записывает задание на диск (бросает → событие не подтверждается),
+   * start() запускает фоновую обработку (после ответа вебхука) и передаёт результат агенту через send.
+   * Без media вложения не обрабатываются, и пользователь получает явное сообщение об этом.
+   */
+  media?: {
+    accept(job: Omit<MediaJob, "state" | "createdAt">): MediaJob;
+    start(job: MediaJob, send: (message: string) => Promise<unknown>): void;
   };
   /** Дописать реплику пользователя в дневной журнал vault (ночная память). Сбой не должен ронять приём. */
   logInbound?(text: string): void;
@@ -150,7 +162,9 @@ export async function handleMaxWebhook(request: Request, deps: MaxWebhookDeps): 
     try {
       store.rememberDialog(event.userId, event.chatId);
       const token = maxContinuationToken(event.userId);
-      const command = event.kind === "message" ? event.text.split(/\s+/, 1)[0]?.toLowerCase() : null;
+      const hasMedia = event.kind === "message" && (event.attachments.length > 0 || (event.linked?.attachments.length ?? 0) > 0);
+      // Команды распознаются только в сообщениях без вложений: подпись к файлу — это просьба к агенту.
+      const command = event.kind === "message" && !hasMedia ? event.text.split(/\s+/, 1)[0]?.toLowerCase() : null;
 
       const c = deps.commands;
       const arg = event.kind === "message" ? event.text.split(/\s+/).slice(1).join(" ") : "";
@@ -171,6 +185,23 @@ export async function handleMaxWebhook(request: Request, deps: MaxWebhookDeps): 
         // /menu, /model, /think, /restart, /update правят .env и перезапускают сервисы —
         // их обслуживает мост (iva-max-bridge). Раз команда дошла сюда, моста нет.
         deps.reply(event.userId, c.needsBridge);
+      } else if (event.kind === "message" && hasMedia) {
+        if (!deps.media) {
+          deps.reply(event.userId, c.mediaUnsupported ?? "Attachments are not supported by this installation.");
+        } else {
+          const job = deps.media.accept({
+            key: event.dedupKey,
+            userId: event.userId,
+            chatId: event.chatId,
+            text: event.text,
+            mid: event.mid,
+            attachments: event.attachments,
+            linked: event.linked,
+          });
+          const state = { userId: event.userId };
+          const auth = maxAuth(event.userId, event.chatId);
+          deps.media.start(job, (message) => deps.send(message, { auth, continuationToken: token, state }));
+        }
       } else if (event.kind === "message") {
         try {
           deps.logInbound?.(event.text);
@@ -188,6 +219,8 @@ export async function handleMaxWebhook(request: Request, deps: MaxWebhookDeps): 
           );
         }
         parts.push(sanitized.text);
+        const quote = linkedQuote(event.linked);
+        if (quote) parts.push(quote);
         await withTimeout(
           deps.send(parts.join("\n\n"), {
             auth: maxAuth(event.userId, event.chatId),
