@@ -73,10 +73,14 @@ function getRuntime(): Runtime | null {
     processor,
     reply: (userId, text) => void outbox.enqueue(userId, text),
     logInbound: (text) => void appendDaily("[text]", text),
+    sendTimeoutMs: numEnv("MAX_AGENT_SEND_TIMEOUT_MS"),
+    unknownGraceMs: numEnv("MAX_SEND_UNKNOWN_GRACE_MS"),
+    flushMs: numEnv("MAX_MEDIA_FLUSH_MS"),
   });
   // Задания, оставшиеся от прошлого процесса, молча не повторяем: сообщаем пользователю об обрыве.
   const interrupted = runner.recover();
   if (interrupted) console.error(`[max] ${interrupted} attachment job(s) were interrupted by a restart; users were notified`);
+  runner.start(); // повторная доставка уведомлений, которые не удалось поставить в очередь
   outbox.start(); // возобновляет недоставленное с прошлого запуска
   runtimeCache = { store, outbox, jobs, runner };
   return runtimeCache;
@@ -111,6 +115,7 @@ const commands = () => ({
   },
   stopped: tr("Stopping…", "Останавливаю…"),
   nothingRunning: tr("Nothing is running right now.", "Сейчас ничего не выполняется."),
+  sendFailed: tr("I could not hand your message to the agent. Please send it again.", "Не удалось передать твоё сообщение агенту. Пришли его ещё раз."),
   mediaUnsupported: tr("Attachments are not enabled in this installation.", "Вложения в этой установке не включены."),
   needsBridge: tr(
     "This command needs the MAX bridge (service iva-max-bridge) — it is not running. Check: iva status",

@@ -327,7 +327,7 @@ test("a restart mid-processing is reported to the user once; the interrupted job
     // «прошлый процесс» принял задание и умер
     const before = createMediaJobs({ dir: join(root, "max"), log: quiet });
     before.accept({ key: "msg:crash", userId: "111", chatId: "500", text: "док", mid: "crash", attachments: [fileAtt("https://never.invalid/f", "a.pdf")], linked: null });
-    before.setProcessing("msg:crash");
+    before.update("msg:crash", { state: "processing" });
     // новый процесс
     const replies = [];
     const after = createMediaJobs({ dir: join(root, "max"), log: quiet });
