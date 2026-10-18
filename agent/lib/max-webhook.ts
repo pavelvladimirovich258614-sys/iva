@@ -26,6 +26,7 @@ import {
 import type { MaxStore } from "./max-store.ts";
 import type { MediaJob } from "./max-media-jobs.ts";
 import { linkedQuote } from "./max-media-runner.ts";
+import { startSendOnce } from "./send-guard.ts";
 
 export interface MaxChannelState {
   userId: string;
@@ -57,6 +58,8 @@ export interface MaxWebhookDeps {
     nothingRunning: string;
     needsBridge: string;
     mediaUnsupported?: string;
+    /** Сообщение, если зависший send() позже всё-таки завершился отказом. */
+    sendFailed?: string;
   };
   /**
    * Обработка вложений. accept() записывает задание на диск (бросает → событие не подтверждается),
@@ -104,16 +107,6 @@ function serialize<T>(key: string, fn: () => Promise<T>): Promise<T> {
     if (userChains.get(key) === tail) userChains.delete(key);
   });
   return next;
-}
-
-function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
-  let t: ReturnType<typeof setTimeout>;
-  return Promise.race([
-    p,
-    new Promise<never>((_, reject) => {
-      t = setTimeout(() => reject(new Error("timeout")), ms);
-    }),
-  ]).finally(() => clearTimeout(t));
 }
 
 export async function handleMaxWebhook(request: Request, deps: MaxWebhookDeps): Promise<Response> {
@@ -221,14 +214,32 @@ export async function handleMaxWebhook(request: Request, deps: MaxWebhookDeps): 
         parts.push(sanitized.text);
         const quote = linkedQuote(event.linked);
         if (quote) parts.push(quote);
-        await withTimeout(
-          deps.send(parts.join("\n\n"), {
-            auth: maxAuth(event.userId, event.chatId),
-            continuationToken: token,
-            state: { userId: event.userId },
-          }),
+        const r = await startSendOnce(
+          () =>
+            deps.send(parts.join("\n\n"), {
+              auth: maxAuth(event.userId, event.chatId),
+              continuationToken: token,
+              state: { userId: event.userId },
+            }),
           deps.sendTimeoutMs ?? 20_000,
         );
+        if (r.kind === "rejected") throw r.error; // определённый отказ Eve: не принято, MAX повторит доставку
+        if (r.kind === "timeout") {
+          // Исход НЕИЗВЕСТЕН: send() мог уже запустить ход и ещё идёт. Повторная доставка запустила бы второй ход
+          // (вторую задачу/напоминание), поэтому событие считается принятым и подтверждается, а за исходным вызовом
+          // идёт наблюдение: если он в итоге откажет — пользователь получит явное сообщение.
+          log("send to the agent timed out; outcome unknown, the event is acknowledged and will NOT be re-run");
+          const userId = event.userId;
+          void r.settled.then((res) => {
+            if (res.ok) return;
+            log(`send finished with a failure after the timeout: ${res.error.message}`.slice(0, 300));
+            try {
+              deps.reply(userId, deps.commands.sendFailed ?? "I could not hand your message to the agent. Please send it again.");
+            } catch (e) {
+              log(`REPLY LOST: ${(e as Error).message}`);
+            }
+          });
+        }
       }
     } catch (err) {
       // Не принято надёжно → снимаем in-flight и просим MAX повторить доставку.

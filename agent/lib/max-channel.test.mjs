@@ -151,16 +151,40 @@ test("in-flight claim from another path answers 503 (not a false 200)", async ()
   assert.equal(h.sent.length, 0);
 });
 
-test("send failure → 500 and the event can be retried; slow send is cut by timeout → 500", async () => {
+test("a definite send failure → 500 and the event can be retried", async () => {
   let fail = true;
   const h = harness({ send: async () => { if (fail) throw new Error("boom"); } });
   assert.equal((await handleMaxWebhook(req(update()), h.deps)).status, 500);
   fail = false;
   assert.equal((await handleMaxWebhook(req(update()), h.deps)).status, 200);
+});
 
-  const slow = harness({ sendTimeoutMs: 30, send: () => new Promise(() => {}) });
-  assert.equal((await handleMaxWebhook(req(update({ mid: "m9" })), slow.deps)).status, 500);
-  assert.equal(slow.deps.store.claim("msg:m9"), "new"); // отметка снята
+test("slow send (timeout) is an UNKNOWN outcome: acknowledged once, never re-run on redelivery", async () => {
+  let calls = 0;
+  let finish;
+  const slow = harness({ sendTimeoutMs: 30, send: () => { calls++; return new Promise((r) => (finish = r)); } });
+  assert.equal((await handleMaxWebhook(req(update({ mid: "m9" })), slow.deps)).status, 200);
+  assert.equal(calls, 1);
+  // MAX повторяет доставку того же события: второго send() быть не должно
+  assert.equal((await handleMaxWebhook(req(update({ mid: "m9" })), slow.deps)).status, 200);
+  assert.equal(calls, 1, "the redelivered event did not start a second turn");
+  finish(); // исходный вызов завершился успешно — пользователю ничего не пишем
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(slow.replies.length, 0);
+  assert.equal(calls, 1);
+});
+
+test("slow send that later FAILS tells the user once and still does not re-run", async () => {
+  let calls = 0;
+  let fail;
+  const slow = harness({ sendTimeoutMs: 20, send: () => { calls++; return new Promise((_, rej) => (fail = rej)); } });
+  slow.deps.commands.sendFailed = "send-failed-notice";
+  assert.equal((await handleMaxWebhook(req(update({ mid: "m10" })), slow.deps)).status, 200);
+  fail(new Error("late boom"));
+  await new Promise((r) => setTimeout(r, 20));
+  assert.deepEqual(slow.replies, [["111", "send-failed-notice"]]);
+  assert.equal((await handleMaxWebhook(req(update({ mid: "m10" })), slow.deps)).status, 200);
+  assert.equal(calls, 1);
 });
 
 test("restart: accepted event stays deduplicated, in-flight one is replayed (at-least-once)", async () => {

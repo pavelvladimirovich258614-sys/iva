@@ -35,11 +35,23 @@ MAX → webhook / polling → bridge → secret → allow-list → dedup → job
 * The access check happens **before** any download. A stranger's attachment is never fetched.
 * `HTTP 200` for a webhook is returned only after the job is durably stored (`data/max/media-jobs.json`);
   if it cannot be stored, MAX gets `5xx` and redelivers.
-* If the process dies while an attachment is being processed, after the restart the user receives
-  “the service was restarted while I was processing your attachment, please send it again”. Nothing is
-  silently dropped and nothing is silently re-run. Delivery is **at-least-once** up to the stored job and
-  *at-most-once, or reported* afterwards. There is no exactly-once guarantee (MAX has no idempotency key
-  for `POST /messages`, and the Eve run and the dedup record are separate writes).
+* **The hand-off to the agent is never repeated blindly.** `send()` in Eve is not idempotent (a second call
+  is a second agent turn, a second task, a second reminder) and `Promise.race` does not cancel it. So:
+  a *definite* rejection (Eve says it did not start) is retried up to 3 times; a **timeout is an unknown
+  outcome** — nothing is repeated, the original call keeps being watched, and its real result is used (success →
+  silent; failure → one notice; still silent after `MAX_SEND_UNKNOWN_GRACE_MS` → one “I cannot tell whether the
+  agent received it, I did NOT repeat it, check /tasks” notice). The same rule applies to plain text messages
+  (the event is acknowledged, not redelivered into a second turn).
+* **The job file records the state before every step** (`queued → processing → sending → unknown/notify`).
+  After a crash or restart nothing is re-run: a job that never reached `send()` is reported as “NOT passed to the
+  agent, send it again”; one that was `sending`/`unknown` is reported as “outcome unknown, not repeated”.
+* **A job is removed only when the agent accepted the message or every needed notice is safely in the outbox.**
+  If the outbox (or the disk) cannot take the notice, the job stays with its pending notices — on disk, or in
+  memory if the disk is also failing (visible as `health.mediaJobs.persistFailing` in `iva max status`) — and is
+  retried every `MAX_MEDIA_FLUSH_MS` (30 s) and at the next start.
+* Delivery is **at-least-once** up to the stored job and *at-most-once, or reported* afterwards. There is no
+  exactly-once guarantee (MAX has no idempotency key for `POST /messages`, and the Eve run and the dedup record
+  are separate writes).
 * The caption is always passed to the agent together with the extracted content. A message that has only an
   attachment starts a turn too. A caption such as `/new` sent *with* a file is a request to the agent,
   not a command.

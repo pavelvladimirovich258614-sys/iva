@@ -69,14 +69,14 @@ async function scenario(mode) {
       MAX_INGEST: mode === "webhook" ? "webhook" : "poll", MAX_BRIDGE_PORT: String(bridgePort), MAX_API_BASE_URL: maxApi.url,
       MAX_OUTBOX_BACKOFF_MS: "300", MAX_MIN_SEND_INTERVAL_MS: "50", AGENT_LANGUAGE: "ru",
       DEEPGRAM_API_KEY: DG_KEY, DEEPGRAM_BASE_URL: `http://127.0.0.1:${dgServer.address().port}`, DEEPGRAM_LANGUAGE: "ru",
-      MAX_MEDIA_FILE_MAX_BYTES: "200000", MAX_MEDIA_IMAGE_MAX_BYTES: "200000", MAX_MEDIA_AUDIO_MAX_BYTES: "200000",
+      MAX_MEDIA_FLUSH_MS: "500", MAX_MEDIA_FILE_MAX_BYTES: "200000", MAX_MEDIA_IMAGE_MAX_BYTES: "200000", MAX_MEDIA_AUDIO_MAX_BYTES: "200000",
     };
     await writeFile(join(app, ".env"), Object.entries(dict).map(([k, v]) => `${k}=${v}`).join("\n") + "\n", { mode: 0o600 });
     const PATH = `${join(sandbox, "fakebin")}:${process.env.PATH}`;
     const eveEnv = { ...dict, PATH, HOME: sandbox, NODE_ENV: "production" };
     const iva = (...args) => runAny(process.execPath, [join(app, "bin/iva.mjs"), ...args], { cwd: app, env: { PATH, HOME: sandbox, NO_COLOR: "1" }, note });
     const evePath = join(app, "node_modules/eve/bin/eve.js");
-    const startEve = () => startProc(process.execPath, [evePath, "start", "--host", "127.0.0.1", "--port", String(evePort)], { cwd: app, env: eveEnv, note, tag: "eve" });
+    const startEve = (extra = {}) => startProc(process.execPath, [evePath, "start", "--host", "127.0.0.1", "--port", String(evePort)], { cwd: app, env: { ...eveEnv, ...extra }, note, tag: "eve" });
     const eveHealthy = async () => { try { return (await fetch(`http://127.0.0.1:${evePort}/`, { signal: AbortSignal.timeout(2000) })).ok; } catch { return false; } };
     const startBridge = () => startProc(process.execPath, ["--env-file=.env", "scripts/max-bridge.mjs"], { cwd: app, env: { PATH, HOME: sandbox, NO_COLOR: "1" }, note, tag: "bridge" });
 
@@ -321,6 +321,78 @@ async function scenario(mode) {
       await sleep(1500);
       assert(openai.requests.length === rq2, "the replayed event started no second turn");
     }
+
+    // ── 9a. тайм-аут send(): исход неизвестен → второго хода/задачи быть не должно ──────────────────────
+    setPhase("send-timeout-no-duplicate");
+    await settle();
+    await stopProc(eve);
+    // 1 мс гарантирует, что НАСТОЯЩИЙ send() Eve «не уложится»: исходный вызов продолжает работать и завершается успешно
+    eve = startEve({ MAX_AGENT_SEND_TIMEOUT_MS: "1", MAX_SEND_UNKNOWN_GRACE_MS: "20000" });
+    await until(eveHealthy, "eve health with a 1 ms send timeout", 90_000);
+    const phrase = "Ива, напомни забрать посылку на почте";
+    rq = openai.requests.length;
+    n = maxApi.received.length;
+    await say(undefined, [att.audio(maxApi.hostFile(makeVoice(phrase)))]);
+    await until(() => maxApi.received.slice(n).some((m) => /Задача создана: Забрать посылку на почте/.test(m.text ?? "")), "task confirmation despite the send timeout", 60_000);
+    await sleep(2500); // время, за которое неконтролируемый повтор успел бы создать вторую задачу
+    const tasks2 = JSON.parse(await readFile(join(dataDir, "tasks.json"), "utf8")).filter((t) => t.text === "Забрать посылку на почте");
+    assert(tasks2.length === 1, `exactly one task, got ${tasks2.length}`);
+    const turns = openai.requests.slice(rq).filter((b) => { const m = b.messages ?? []; const last = m.at(-1); return last?.role === "user" && JSON.stringify(last.content).includes(phrase); });
+    assert(turns.length === 1, `exactly one agent turn for the voice message, got ${turns.length}`);
+    assert(!maxApi.received.slice(n).some((m) => /Не знаю, получил ли агент|cannot tell whether/.test(m.text ?? "")), "a send that finished within the grace period raises no alarm");
+    await until(async () => (await (await fetch(`http://127.0.0.1:${evePort}/eve/v1/max/status`, { headers: { "x-max-bot-api-secret": SECRET } })).json()).health.mediaJobs.pending === 0, "job closed after the original send finished", 30_000);
+    await stopProc(eve);
+    eve = startEve();
+    await until(eveHealthy, "eve health (normal timeouts)", 90_000);
+
+    // ── 9b. сбой диска при постановке уведомления в очередь ─────────────────────────────────────────────
+    setPhase("disk-failure-while-queueing-notice");
+    await settle();
+    const outboxFile = join(dataDir, "max", "outbox.json");
+    await rm(outboxFile, { force: true });
+    await mkdir(outboxFile); // запись outbox.json теперь невозможна (rename файла на каталог) — как «диск отказал»
+    n = maxApi.received.length;
+    rq = openai.requests.length;
+    await say(undefined, [att.file(maxApi.hostFile(Buffer.alloc(0)), "empty-during-outage.txt", 0)]);
+    const jobsFile = join(dataDir, "max", "media-jobs.json");
+    await until(async () => { try { return Object.values(JSON.parse(await readFile(jobsFile, "utf8")).jobs).some((j) => j.state === "notify" && j.pendingNotices?.length); } catch { return false; } }, "the job is kept with its pending notice while the outbox is down", 30_000);
+    await sleep(1200);
+    assert(maxApi.received.length === n, "nothing could be delivered during the outage");
+    let st = await (await fetch(`http://127.0.0.1:${evePort}/eve/v1/max/status`, { headers: { "x-max-bot-api-secret": SECRET } })).json();
+    assert(st.health.mediaJobs.pending >= 1, `the pending job is visible in status: ${JSON.stringify(st.health)}`);
+    await rm(outboxFile, { recursive: true, force: true }); // диск «починился»
+    await until(() => maxApi.received.slice(n).some((m) => /пустой|empty/.test(m.text ?? "")), "the deferred notice is delivered after recovery", 30_000);
+    await sleep(1500);
+    assert(maxApi.received.slice(n).filter((m) => /пустой|empty/.test(m.text ?? "")).length === 1, "delivered exactly once");
+    assert(openai.requests.length === rq, "no agent turn was started for the rejected file");
+    st = await (await fetch(`http://127.0.0.1:${evePort}/eve/v1/max/status`, { headers: { "x-max-bot-api-secret": SECRET } })).json();
+    assert(st.health.mediaJobs.pending === 0, `job removed once the notice was queued: ${JSON.stringify(st.health)}`);
+
+    // ── 9c. SIGKILL и восстановление из состояний задания ─────────────────────────────────────────────
+    setPhase("sigkill-recovery-states");
+    await settle();
+    await stopProc(eve, "SIGKILL");
+    const seeded = (key, state, extra = {}) => [key, { key, userId: USER, chatId: CHAT, text: "", mid: key, attachments: [], linked: null, createdAt: Date.now(), state, ...extra }];
+    await writeFile(jobsFile, JSON.stringify({ jobs: Object.fromEntries([
+      seeded("msg:seed-sending", "sending"), // send() уже вызывался: исход неизвестен
+      seeded("msg:seed-processing", "processing"), // send() не вызывался
+      seeded("msg:seed-notify", "notify", { pendingNotices: ["⚠️ seeded deferred notice"] }),
+      seeded("msg:seed-unknown-told", "unknown", { noticeSent: true }), // владельца уже предупредили
+    ]) }));
+    rq = openai.requests.length;
+    n = maxApi.received.length;
+    eve = startEve();
+    await until(eveHealthy, "eve health after SIGKILL", 90_000);
+    await until(() => maxApi.received.slice(n).length >= 3, "recovery notices", 60_000);
+    await sleep(1500);
+    const got = maxApi.received.slice(n).map((m) => m.text ?? "");
+    assert(got.some((t) => /Не знаю, получил ли агент|cannot tell whether/.test(t) && /НЕ повторяла|did NOT repeat/.test(t)), `'unknown outcome' notice for the job that was sending: ${JSON.stringify(got)}`);
+    assert(got.some((t) => /НЕ передано агенту|NOT passed/.test(t)), "'not passed' notice for the job that never reached send()");
+    assert(got.some((t) => t === "⚠️ seeded deferred notice"), "the deferred notice from the previous process is delivered");
+    assert(got.length === 3, `exactly three notices, no duplicates: ${JSON.stringify(got)}`);
+    assert(openai.requests.length === rq, "recovery re-ran nothing (no model requests)");
+    const left = JSON.parse(await readFile(jobsFile, "utf8")).jobs;
+    assert(Object.keys(left).length === 0, `all jobs closed: ${JSON.stringify(left)}`);
 
     // ── 10. состояние и гигиена ───────────────────────────────────────────────
     setPhase("hygiene");
