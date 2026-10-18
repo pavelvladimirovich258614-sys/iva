@@ -21,8 +21,23 @@ export const DEAD_KEEP = 100;
 
 export type InboxClaim = "new" | "in_flight" | "done";
 
+/** Файл для отправки: путь на диске проверен при постановке и повторно перед загрузкой. */
+export interface OutboxAttachmentFile {
+  path: string;
+  fileName: string;
+  uploadType: "image" | "video" | "audio" | "file";
+  mimeType: string;
+  size: number;
+  /** Payload вложения после успешной загрузки: повторные попытки отправки не грузят файл заново. */
+  attachment?: { type: "image" | "video" | "audio" | "file"; payload: Record<string, unknown> };
+  uploadedAt?: number;
+}
+
 export interface OutboxItem {
   id: string;
+  /** Отсутствует у записей старых версий — это текст. */
+  kind?: "text" | "file";
+  file?: OutboxAttachmentFile;
   userId: string;
   /** Последний известный chat_id на момент постановки; null → адресуем по user_id. */
   chatId: string | null;
@@ -53,6 +68,10 @@ export interface MaxStore {
   rememberDialog(userId: string, chatId: string | null): void;
   dialogChatId(userId: string): string | null;
   enqueue(userId: string, chunks: string[]): OutboxItem[];
+  /** Ставит в очередь отправку файла (подпись — text). Бросает, если очередь не удалось сохранить. */
+  enqueueFile(userId: string, file: OutboxAttachmentFile, caption: string): OutboxItem;
+  /** Сохраняет изменение элемента очереди (например, payload загруженного вложения). */
+  patchFile(id: string, patch: Partial<OutboxAttachmentFile>): void;
   due(now?: number): OutboxItem[];
   /** Все queued-элементы пользователя по порядку постановки. */
   queuedFor(userId: string): OutboxItem[];
@@ -259,6 +278,38 @@ export function createMaxStore({
       }
       return items;
     },
+    enqueueFile(userId, file, caption) {
+      const chatId = state.dialogs[userId] ?? null;
+      const t = now();
+      const item: OutboxItem = {
+        id: `${t.toString(36)}-${++outbox.seq}`,
+        kind: "file",
+        file,
+        userId,
+        chatId,
+        seq: outbox.seq,
+        text: caption,
+        textLength: caption.length,
+        state: "queued",
+        attempts: 0,
+        createdAt: t,
+        nextAt: t,
+      };
+      outbox.items.push(item);
+      try {
+        saveOutbox();
+      } catch (err) {
+        outbox.items.pop();
+        throw err;
+      }
+      return item;
+    },
+    patchFile(id, patch) {
+      const item = outbox.items.find((i) => i.id === id);
+      if (!item?.file) return;
+      item.file = { ...item.file, ...patch };
+      saveOutbox();
+    },
     due(at = now()) {
       return outbox.items.filter((i) => i.state === "queued" && i.nextAt <= at);
     },
@@ -275,6 +326,7 @@ export function createMaxStore({
       if (nextAt === null) {
         item.state = "dead";
         item.text = "";
+        if (item.file) item.file = { ...item.file, path: "", attachment: undefined }; // диагностика без путей и токенов
       } else {
         item.nextAt = nextAt;
       }

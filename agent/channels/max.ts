@@ -6,6 +6,12 @@ import { defineChannel, GET, POST } from "eve/channels";
 import { appendDaily } from "../lib/daily-log.js";
 import { humanizeProviderError } from "../lib/error-humanizer.js";
 import { createMaxClient, resolveMaxBaseUrl } from "../lib/max-api.js";
+import { createMediaJobs } from "../lib/max-media-jobs.js";
+import { cleanStaleTmp, createMediaProcessor, loadMediaConfig } from "../lib/max-media.js";
+import { createMediaRunner } from "../lib/max-media-runner.js";
+import { checkSendableFile } from "../lib/max-send-policy.js";
+import { sttConfigured, transcribeFile } from "../lib/stt.js";
+import { describeImage, visionAvailable } from "../vision.js";
 import { createMaxOutbox } from "../lib/max-outbox.js";
 import { createMaxStore, maxDataDir } from "../lib/max-store.js";
 import { readBodyLimited } from "../lib/max-body.js";
@@ -26,7 +32,12 @@ const numEnv = (name: string) => {
 // нельзя открыть (нет прав на data/max, нечитаемый файл), приложение Eve в целом остаётся живым,
 // а MAX-роуты отвечают 503 и логируют причину — вместо ложного 404/200. Повторная попытка — на
 // следующем запросе.
-type Runtime = { store: ReturnType<typeof createMaxStore>; outbox: ReturnType<typeof createMaxOutbox> };
+type Runtime = {
+  store: ReturnType<typeof createMaxStore>;
+  outbox: ReturnType<typeof createMaxOutbox>;
+  jobs: ReturnType<typeof createMediaJobs>;
+  runner: ReturnType<typeof createMediaRunner>;
+};
 let runtimeCache: Runtime | null = null;
 function getRuntime(): Runtime | null {
   if (!config) return null;
@@ -42,8 +53,32 @@ function getRuntime(): Runtime | null {
     backoffBaseMs: numEnv("MAX_OUTBOX_BACKOFF_MS"),
     minIntervalMs: numEnv("MAX_MIN_SEND_INTERVAL_MS"),
   });
+  const dir = maxDataDir();
+  const apiBase = resolveMaxBaseUrl(process.env.MAX_API_BASE_URL);
+  const loopbackApi = ["127.0.0.1", "localhost", "[::1]"].includes(new URL(apiBase).hostname);
+  const mediaCfg = loadMediaConfig(process.env, { dataDir: dir, loopbackApi });
+  cleanStaleTmp(mediaCfg.tmpDir);
+  const jobs = createMediaJobs({ dir });
+  const processor = createMediaProcessor(mediaCfg, {
+    client,
+    describeImage,
+    transcribe: (path, mimeType) => transcribeFile(path, { mimeType }),
+    sttConfigured: () => sttConfigured(),
+    visionConfigured: () => visionAvailable(),
+    appendDaily: (type, content) => appendDaily(type, content),
+    log: (m) => console.error(`[max] media: ${m}`),
+  });
+  const runner = createMediaRunner({
+    jobs,
+    processor,
+    reply: (userId, text) => void outbox.enqueue(userId, text),
+    logInbound: (text) => void appendDaily("[text]", text),
+  });
+  // Задания, оставшиеся от прошлого процесса, молча не повторяем: сообщаем пользователю об обрыве.
+  const interrupted = runner.recover();
+  if (interrupted) console.error(`[max] ${interrupted} attachment job(s) were interrupted by a restart; users were notified`);
   outbox.start(); // возобновляет недоставленное с прошлого запуска
-  runtimeCache = { store, outbox };
+  runtimeCache = { store, outbox, jobs, runner };
   return runtimeCache;
 }
 function tryRuntime(): Runtime | null | "unavailable" {
@@ -76,6 +111,7 @@ const commands = () => ({
   },
   stopped: tr("Stopping…", "Останавливаю…"),
   nothingRunning: tr("Nothing is running right now.", "Сейчас ничего не выполняется."),
+  mediaUnsupported: tr("Attachments are not enabled in this installation.", "Вложения в этой установке не включены."),
   needsBridge: tr(
     "This command needs the MAX bridge (service iva-max-bridge) — it is not running. Check: iva status",
     "Эта команда работает через MAX-мост (сервис iva-max-bridge), а он не запущен. Проверь: iva status",
@@ -102,7 +138,7 @@ export default defineChannel<MaxChannelState, { state: MaxChannelState }>({
   state: { userId: "" },
   context: (state) => ({ state }),
   routes: [
-    POST<MaxChannelState>("/eve/v1/max", async (request, { send, reset, cancel }) => {
+    POST<MaxChannelState>("/eve/v1/max", async (request, { send, reset, cancel, waitUntil }) => {
       if (!config) return new Response("not found", { status: 404 }); // MAX выключен
       const runtime = tryRuntime();
       if (runtime === "unavailable" || !runtime) return new Response("storage unavailable", { status: 503 });
@@ -114,6 +150,17 @@ export default defineChannel<MaxChannelState, { state: MaxChannelState }>({
         reset: (options) => reset(options),
         cancel: (options) => cancel(options),
         commands: commands(),
+        media: {
+          accept: (job) => runtime.jobs.accept(job),
+          start: (job, sendMessage) => {
+            const p = runtime.runner.run(job, sendMessage);
+            try {
+              waitUntil(p);
+            } catch {
+              /* окружение без waitUntil: промис всё равно выполняется */
+            }
+          },
+        },
         logInbound: (text) => void appendDaily("[text]", text),
       });
     }),
@@ -136,6 +183,42 @@ export default defineChannel<MaxChannelState, { state: MaxChannelState }>({
       const result = await reset({ continuationToken: maxContinuationToken(userId), reason: "MAX bridge restart" });
       return Response.json({ ok: true, result });
     }),
+    // Отправка файла пользователю (вызывает инструмент max_send_file): тот же секрет, что и у webhook.
+    POST<MaxChannelState>("/eve/v1/max/send-file", async (request) => {
+      if (!config) return new Response("not found", { status: 404 });
+      if (!verifyMaxSecret(request.headers.get(MAX_SECRET_HEADER), config.webhookSecret)) {
+        return new Response("unauthorized", { status: 401 });
+      }
+      const runtime = tryRuntime();
+      if (runtime === "unavailable" || !runtime) return new Response("storage unavailable", { status: 503 });
+      const body = await readBodyLimited(request, { maxBytes: 16 * 1024, timeoutMs: 5000 });
+      if (!body.ok) return Response.json({ ok: false, error: body.reason }, { status: body.status });
+      let input: { userId?: unknown; path?: unknown; caption?: unknown; name?: unknown } = {};
+      try {
+        input = parseMaxJson(body.text) as typeof input;
+      } catch {
+        return Response.json({ ok: false, error: "invalid JSON" }, { status: 400 });
+      }
+      // Адресат — только пользователь из allowlist; без явного адресата — единственный владелец.
+      let userId = typeof input.userId === "string" ? input.userId : "";
+      if (!userId && config.allowedUserIds.size === 1) userId = [...config.allowedUserIds][0]!;
+      if (!config.allowedUserIds.has(userId)) return Response.json({ ok: false, error: "recipient is not allowed" }, { status: 403 });
+      if (typeof input.path !== "string" || !input.path) return Response.json({ ok: false, error: "path is required" }, { status: 400 });
+      const checked = checkSendableFile(input.path, { displayName: typeof input.name === "string" ? input.name : undefined });
+      if (!checked.ok) return Response.json({ ok: false, code: checked.code, error: checked.reason }, { status: 422 });
+      try {
+        const caption = typeof input.caption === "string" ? scanOutbound(input.caption).text : "";
+        const item = runtime.outbox.enqueueFile(
+          userId,
+          { path: checked.realPath, fileName: checked.fileName, uploadType: checked.uploadType, mimeType: checked.mimeType, size: checked.size },
+          caption,
+        );
+        return Response.json({ ok: true, queued: true, id: item.id, fileName: checked.fileName, uploadType: checked.uploadType, size: checked.size });
+      } catch (err) {
+        console.error("[max] FILE NOT QUEUED:", (err as Error).message);
+        return Response.json({ ok: false, error: "could not persist the delivery queue" }, { status: 503 });
+      }
+    }),
     // Диагностика очереди: тот же секрет, что и у webhook; без текстов сообщений.
     GET<MaxChannelState>("/eve/v1/max/status", async (request) => {
       if (!config) return new Response("not found", { status: 404 });
@@ -150,7 +233,7 @@ export default defineChannel<MaxChannelState, { state: MaxChannelState }>({
         queued: s.queued,
         dead: s.dead,
         oldestQueuedAt: s.oldestQueuedAt,
-        health: s.health,
+        health: { ...s.health, mediaJobs: runtime.jobs.health() },
         deadItems: s.deadItems.map(({ id, userId, attempts, textLength, lastError, createdAt }) => ({
           id,
           userId,

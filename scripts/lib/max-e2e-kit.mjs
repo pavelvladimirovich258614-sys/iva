@@ -37,16 +37,43 @@ export function freePort() {
 // int64 в JSON-числах, как у настоящего MAX (строкой его не шлют)
 export const toWire = (u) => JSON.stringify(u).replace(/"(user_id|chat_id)":"(-?\d+)"/g, '"$1":$2');
 
-export const msg = ({ text, mid, userId, chatId, chatType = "dialog" }) => ({
+export const msg = ({ text, mid, userId, chatId, chatType = "dialog", attachments, link }) => ({
   update_type: "message_created",
   timestamp: Date.now(),
   message: {
     sender: { user_id: userId, first_name: "T", is_bot: false },
     recipient: { chat_type: chatType, chat_id: chatId, user_id: null },
     timestamp: Date.now(),
-    body: { mid, seq: 1, text },
+    body: { mid, seq: 1, text, ...(attachments ? { attachments } : {}) },
+    ...(link ? { link } : {}),
   },
 });
+
+/** Вложения в форме официальной схемы MAX (Attachment → payload.url/token…). */
+export const att = {
+  image: (url, token = "img-tok") => ({ type: "image", payload: { photo_id: 1234567890123456789, token, url } }),
+  audio: (url, token = "aud-tok", transcription = null) => ({ type: "audio", payload: { url, token }, ...(transcription !== null ? { transcription } : {}) }),
+  file: (url, filename, size, token = "file-tok") => ({ type: "file", payload: { url, token }, filename, size }),
+  video: (token = "vid-tok") => ({ type: "video", payload: { url: "https://unused.invalid/v", token }, duration: 3, width: 320, height: 240 }),
+};
+
+/** Разбор multipart/form-data с одним файловым полем (достаточно для проверки загрузки). */
+export function parseMultipart(buf, contentType) {
+  const m = /boundary=(.+)$/i.exec(contentType ?? "");
+  if (!m) return null;
+  const boundary = Buffer.from(`--${m[1]}`);
+  const start = buf.indexOf(boundary);
+  if (start < 0) return null;
+  const headEnd = buf.indexOf(Buffer.from("\r\n\r\n"), start);
+  const head = buf.subarray(start + boundary.length, headEnd).toString("utf8");
+  const dataStart = headEnd + 4;
+  const dataEnd = buf.indexOf(Buffer.from(`\r\n--${m[1]}`), dataStart);
+  if (dataEnd < 0) return null;
+  const field = /name="([^"]*)"/.exec(head)?.[1] ?? "";
+  const fileName = /filename="([^"]*)"/.exec(head)?.[1] ?? "";
+  const ct = /Content-Type:\s*([^\r\n]+)/i.exec(head)?.[1] ?? "";
+  return { field, fileName, contentType: ct, bytes: buf.subarray(dataStart, dataEnd) };
+}
 export const callback = ({ payload, mid, userId, chatId, id = `cb-${Math.random().toString(36).slice(2)}` }) => ({
   update_type: "message_callback",
   timestamp: Date.now(),
@@ -74,19 +101,66 @@ export async function startMockMax({ token, webhookTarget = () => null }) {
   const updates = []; // очередь polling
   const subs = []; // { url, secret, types }
   const pollLog = []; // каждый GET /updates: { marker, subscribed }
-  const state = { seq: 0, mid: 0, committed: 0, failNext: 0, status: 500, webhookDeliveries: [] };
+  const state = { seq: 0, mid: 0, committed: 0, failNext: 0, status: 500, webhookDeliveries: [], uploadSeq: 0, uploadFail: 0, notReady: 0, mediaSeq: 0 };
+  const media = new Map(); // id → { bytes, contentType, status, location }
+  const mediaRequests = [];
+  const endpoints = new Map(); // upload id → { type, upload? }
+  const uploads = [];
+  const uploadAuth = [];
+  const deliveredFiles = []; // файлы, доставленные пользователю POST /messages (с байтами загрузки)
+  const videos = new Map(); // token → { url }
 
   const server = createHttp(async (req, res) => {
     const chunks = [];
     for await (const c of req) chunks.push(c);
-    const raw = Buffer.concat(chunks).toString();
+    const rawBuf = Buffer.concat(chunks);
+    const raw = rawBuf.toString();
     const url = new URL(req.url, "http://x");
     const json = (obj, code = 200) => {
       res.writeHead(code, { "content-type": "application/json" });
       res.end(JSON.stringify(obj));
     };
-    if (req.headers.authorization !== token) return json({ code: "verify.token", message: "bad token" }, 401);
     const p = url.pathname;
+    // Хостинг файлов вложений: без авторизации, как CDN MAX. Фиксируем, не прислали ли нам токен бота.
+    if (req.method === "GET" && p.startsWith("/media/")) {
+      const id = p.slice(7);
+      const f = media.get(id);
+      mediaRequests.push({ id, authorization: req.headers.authorization ?? null });
+      if (!f) { res.writeHead(404); return res.end(); }
+      if (f.delayMs) await sleep(f.delayMs);
+      if (f.status && f.status !== 200) { res.writeHead(f.status, f.status >= 300 && f.status < 400 && f.location ? { location: f.location } : {}); return res.end(); }
+      res.writeHead(200, { "content-type": f.contentType ?? "application/octet-stream", "content-length": f.bytes.length });
+      return res.end(f.bytes);
+    }
+    // Приём загрузки файла (адрес выдан POST /uploads): multipart, без авторизации.
+    if (req.method === "POST" && p.startsWith("/upload/")) {
+      const id = p.slice(8);
+      const ep = endpoints.get(id);
+      uploadAuth.push(req.headers.authorization ?? null);
+      if (!ep) { res.writeHead(404); return res.end(); }
+      if (state.uploadFail > 0) { state.uploadFail--; res.writeHead(500); return res.end("{}"); }
+      const part = parseMultipart(rawBuf, req.headers["content-type"]);
+      if (!part || part.field !== "data") { res.writeHead(400); return res.end("{}"); }
+      ep.upload = { fileName: part.fileName, contentType: part.contentType, bytes: part.bytes };
+      uploads.push({ id, type: ep.type, ...ep.upload });
+      if (ep.type === "image") return json({ photos: { [`p${id}`]: { token: `ptok-${id}` } } });
+      if (ep.type === "file") return json({ token: `ftok-${id}` });
+      return json({ retval: "1" });
+    }
+    if (req.headers.authorization !== token) return json({ code: "verify.token", message: "bad token" }, 401);
+    if (req.method === "POST" && p === "/uploads") {
+      const type = url.searchParams.get("type");
+      if (!["image", "video", "audio", "file"].includes(type)) return json({ code: "proto.payload", message: "bad type" }, 400);
+      const id = String(++state.uploadSeq);
+      endpoints.set(id, { type });
+      return json({ url: `${api.url}/upload/${id}`, ...(type === "audio" || type === "video" ? { token: `etok-${id}` } : {}) });
+    }
+    if (req.method === "GET" && p.startsWith("/videos/")) {
+      const t = decodeURIComponent(p.slice(8));
+      const v = videos.get(t);
+      if (!v) return json({ code: "not.found" }, 404);
+      return json({ token: t, urls: { mp4_360: v.url }, width: 320, height: 240, duration: 3 });
+    }
     if (req.method === "POST" && p === "/messages") {
       if (state.failNext > 0) {
         state.failNext--;
@@ -95,6 +169,17 @@ export async function startMockMax({ token, webhookTarget = () => null }) {
         return;
       }
       const body = JSON.parse(raw);
+      if (Array.isArray(body.attachments) && body.attachments.some((a) => a.type !== "inline_keyboard")) {
+        // как у MAX: вложение, ещё не обработанное платформой, отправить нельзя (HTTP 400)
+        if (state.notReady > 0) { state.notReady--; return json({ code: "attachment.not.ready", message: "not ready" }, 400); }
+        const a = body.attachments[0];
+        const tok = a.payload?.token ?? Object.values(a.payload?.photos ?? {})[0]?.token;
+        const known = String(tok ?? "");
+        const id = known.replace(/^(ptok|ftok|etok)-/, "");
+        const real = endpoints.get(id);
+        if (!real?.upload) return json({ code: "attachment.not.ready", message: "no such upload" }, 400);
+        deliveredFiles.push({ type: a.type, token: known, fileName: real.upload.fileName, bytes: real.upload.bytes, text: body.text ?? null });
+      }
       const mid = `mid-${++state.mid}`;
       received.push({ query: url.search, text: body.text, body, mid });
       timeline.push({ type: "send", mid, body });
@@ -164,7 +249,15 @@ export async function startMockMax({ token, webhookTarget = () => null }) {
     return r.status;
   }
   const api = {
-    received, edits, answers, deletes, commands, subs, pollLog, state, timeline,
+    received, edits, answers, deletes, commands, subs, pollLog, state, timeline, mediaRequests, uploads, uploadAuth, deliveredFiles,
+    /** Кладёт файл «на CDN MAX» и возвращает его URL (для payload.url входящего вложения). */
+    hostFile(bytes, { contentType, status, location, delayMs } = {}) {
+      const id = `f${++state.mediaSeq}`;
+      media.set(id, { bytes: Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes), contentType, status, location, delayMs });
+      return `${api.url}/media/${id}`;
+    },
+    expireFile(url) { const f = media.get(new URL(url).pathname.slice(7)); if (f) f.status = 410; },
+    hostVideo(token, bytes) { videos.set(token, { url: api.hostFile(bytes, { contentType: "video/mp4" }) }); },
     url: `http://127.0.0.1:${server.address().port}`,
     pushPoll: (update) => updates.push({ seq: ++state.seq, update }),
     deliverWebhook,
